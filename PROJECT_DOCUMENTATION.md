@@ -1,7 +1,7 @@
 # HackerAI — Official Technical Documentation
 
 > **Version:** 1.0 · **Date:** 2026-07-26  
-> **Repository:** [github.com/hackerai-tech/hackerai](https://github.com/hackerai-tech/hackerai)  
+> **Repository:** [github.com/itssourov13/hackerai-main](https://github.com/itssourov13/hackerai-main)  
 > **Live product:** [hackerai.co](https://hackerai.co)
 
 ---
