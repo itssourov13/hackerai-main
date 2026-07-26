@@ -43,7 +43,7 @@ You'll need the following accounts:
 ### Clone the repo
 
 ```bash
-git clone https://github.com/hackerai-tech/hackerai.git
+git clone https://github.com/itssourov13/hackerai-main.git
 ```
 
 ### Navigate to the project directory
