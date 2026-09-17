@@ -13,7 +13,7 @@ import {
 import { phLogger } from "@/lib/posthog/server";
 import { assertUserCanAccessChatHistory } from "@/lib/suspensions";
 
-export const maxDuration = 300;
+export const maxDuration = 299;
 
 export async function GET(
   req: NextRequest,
