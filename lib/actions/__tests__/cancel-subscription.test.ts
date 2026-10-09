@@ -14,6 +14,9 @@ import {
 const mockListSubscriptions = jest.fn();
 const mockUpdateSubscription = jest.fn();
 const mockCancelSubscription = jest.fn();
+const mockRetrieveInvoice = jest.fn();
+const mockVoidInvoice = jest.fn();
+const mockListInvoicePayments = jest.fn();
 const mockGetBillingActionContext = jest.fn();
 const mockPostHogEvent = jest.fn();
 const mockPostHogError = jest.fn();
@@ -27,6 +30,8 @@ jest.mock("@/app/api/stripe", () => ({
       update: mockUpdateSubscription,
       cancel: mockCancelSubscription,
     },
+    invoices: { retrieve: mockRetrieveInvoice, voidInvoice: mockVoidInvoice },
+    invoicePayments: { list: mockListInvoicePayments },
   },
 }));
 
@@ -51,6 +56,11 @@ describe("cancelSubscriptionAction", () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockListInvoicePayments.mockResolvedValue({
+      data: [],
+      has_more: false,
+    } as never);
+    mockVoidInvoice.mockResolvedValue({ status: "void" } as never);
     delete process.env.CONVEX_SERVICE_ROLE_KEY;
     mockGetConvexClient.mockReturnValue({
       mutation: mockConvexMutation,
@@ -72,6 +82,22 @@ describe("cancelSubscriptionAction", () => {
     } else {
       process.env.CONVEX_SERVICE_ROLE_KEY = originalConvexServiceRoleKey;
     }
+  });
+
+  it("rejects a structured follow-up that does not match the main reason", async () => {
+    const { default: cancelSubscriptionAction } =
+      await import("../cancel-subscription");
+
+    await expect(
+      cancelSubscriptionAction({
+        cancellationReason: {
+          reasonCategory: "missing_feature",
+          reasonSubcategory: "billing_or_renewal",
+          reasonDetails: "This pairing should not be accepted",
+        },
+      }),
+    ).rejects.toThrow("Please select what best describes the issue");
+    expect(mockGetBillingActionContext).not.toHaveBeenCalled();
   });
 
   it("returns success without updating Stripe when cancellation is already scheduled", async () => {
@@ -103,6 +129,7 @@ describe("cancelSubscriptionAction", () => {
       cancelSubscriptionAction({
         cancellationReason: {
           reasonCategory: "other",
+          reasonSubcategory: "billing_or_renewal",
           reasonDetails: "Already handled",
         },
       }),
@@ -137,7 +164,25 @@ describe("cancelSubscriptionAction", () => {
                 price: {
                   id: "price_pro",
                   lookup_key: "pro-monthly-plan",
+                  unit_amount: 2500,
+                  recurring: {
+                    interval: "month",
+                    interval_count: 1,
+                  },
                 },
+                quantity: 2,
+              },
+              {
+                price: {
+                  id: "price_addon",
+                  lookup_key: "agent-addon-yearly",
+                  unit_amount: 12000,
+                  recurring: {
+                    interval: "year",
+                    interval_count: 1,
+                  },
+                },
+                quantity: 1,
               },
             ],
           },
@@ -158,6 +203,7 @@ describe("cancelSubscriptionAction", () => {
       cancelSubscriptionAction({
         cancellationReason: {
           reasonCategory: "other",
+          reasonSubcategory: "billing_or_renewal",
           reasonDetails: "Done for now",
         },
       }),
@@ -172,6 +218,7 @@ describe("cancelSubscriptionAction", () => {
       cancel_at_period_end: true,
       cancellation_details: {
         feedback: "other",
+        comment: "Done for now",
       },
     });
     expect(mockPostHogEvent).toHaveBeenNthCalledWith(
@@ -184,6 +231,16 @@ describe("cancelSubscriptionAction", () => {
       PAID_FUNNEL_EVENTS.cancellationCompleted,
       expect.objectContaining({
         $insert_id: cancellationCompletionInsertId("sub_123"),
+        cancellation_reason: "cancellation_requested",
+        churn_type: "voluntary",
+        voluntary_churn: true,
+        involuntary_churn: false,
+        billing_interval: undefined,
+        billing_interval_count: undefined,
+        subscription_item_count: 2,
+        subscription_mrr_dollars: 60,
+        attributed_mrr_dollars: 60,
+        at_risk_mrr_dollars: 60,
       }),
     );
   });
@@ -224,6 +281,7 @@ describe("cancelSubscriptionAction", () => {
       cancelSubscriptionAction({
         cancellationReason: {
           reasonCategory: "too_expensive",
+          reasonSubcategory: "too_expensive_low_frequency",
           reasonDetails: "The renewal payment failed",
         },
       }),
@@ -236,6 +294,7 @@ describe("cancelSubscriptionAction", () => {
     expect(mockCancelSubscription).toHaveBeenCalledWith("sub_past_due", {
       cancellation_details: {
         feedback: "too_expensive",
+        comment: "The renewal payment failed",
       },
       invoice_now: false,
       prorate: false,
@@ -248,6 +307,70 @@ describe("cancelSubscriptionAction", () => {
         cancellation_completion_type: "immediate_in_app",
         cancel_at_period_end: false,
       }),
+    );
+  });
+
+  it("voids the open renewal invoice after an immediate cancellation", async () => {
+    mockListSubscriptions.mockResolvedValue({
+      data: [
+        {
+          id: "sub_past_due",
+          status: "past_due",
+          cancel_at_period_end: false,
+          items: {
+            data: [
+              { price: { id: "price_pro", lookup_key: "pro-monthly-plan" } },
+            ],
+          },
+        },
+      ],
+    } as never);
+    mockCancelSubscription.mockResolvedValue({
+      id: "sub_past_due",
+      status: "canceled",
+      customer: "cus_123",
+      latest_invoice: "in_renewal",
+      cancellation_details: { reason: "cancellation_requested" },
+      cancel_at_period_end: false,
+    } as never);
+    mockRetrieveInvoice.mockResolvedValue({
+      id: "in_renewal",
+      customer: "cus_123",
+      parent: { subscription_details: { subscription: "sub_past_due" } },
+      billing_reason: "subscription_cycle",
+      collection_method: "charge_automatically",
+      status: "open",
+      amount_remaining: 6000,
+      amount_paid: 0,
+      lines: {
+        has_more: false,
+        data: [
+          {
+            parent: {
+              type: "subscription_item_details",
+              subscription_item_details: {
+                subscription: "sub_past_due",
+                proration: false,
+              },
+            },
+          },
+        ],
+      },
+    } as never);
+
+    const { default: cancelSubscriptionAction } =
+      await import("../cancel-subscription");
+    await cancelSubscriptionAction({
+      cancellationReason: {
+        reasonCategory: "other",
+        reasonSubcategory: "billing_or_renewal",
+        reasonDetails: "Renewal did not go through",
+      },
+    });
+
+    expect(mockVoidInvoice).toHaveBeenCalledWith("in_renewal");
+    expect(mockCancelSubscription.mock.invocationCallOrder[0]).toBeLessThan(
+      mockVoidInvoice.mock.invocationCallOrder[0],
     );
   });
 
@@ -289,14 +412,27 @@ describe("cancelSubscriptionAction", () => {
     await cancelSubscriptionAction({
       cancellationReason: {
         reasonCategory: "other",
+        reasonSubcategory: "billing_or_renewal",
         reasonDetails: "Done for now",
       },
     });
 
+    expect(mockConvexMutation).toHaveBeenNthCalledWith(
+      1,
+      expect.anything(),
+      expect.objectContaining({
+        reasonCategory: "other",
+        reasonSubcategory: "billing_or_renewal",
+        reasonDetails: "Done for now",
+      }),
+    );
     expect(mockPostHogEvent).toHaveBeenCalledTimes(1);
     expect(mockPostHogEvent).toHaveBeenCalledWith(
       PAID_FUNNEL_EVENTS.cancellationReasonSubmitted,
-      expect.any(Object),
+      expect.objectContaining({
+        reason_category: "other",
+        reason_subcategory: "billing_or_renewal",
+      }),
     );
   });
 
@@ -338,6 +474,7 @@ describe("cancelSubscriptionAction", () => {
     await cancelSubscriptionAction({
       cancellationReason: {
         reasonCategory: "other",
+        reasonSubcategory: "billing_or_renewal",
         reasonDetails: "Done for now",
       },
     });
@@ -382,6 +519,7 @@ describe("cancelSubscriptionAction", () => {
       cancelSubscriptionAction({
         cancellationReason: {
           reasonCategory: "other",
+          reasonSubcategory: "billing_or_renewal",
           reasonDetails: "Done for now",
         },
       }),
@@ -412,6 +550,7 @@ describe("cancelSubscriptionAction", () => {
       cancelSubscriptionAction({
         cancellationReason: {
           reasonCategory: "other",
+          reasonSubcategory: "billing_or_renewal",
           reasonDetails: "Done for now",
         },
       }),
@@ -440,6 +579,7 @@ describe("cancelSubscriptionAction", () => {
       cancelSubscriptionAction({
         cancellationReason: {
           reasonCategory: "other",
+          reasonSubcategory: "billing_or_renewal",
           reasonDetails: "Done for now",
         },
       }),
@@ -462,6 +602,7 @@ describe("cancelSubscriptionAction", () => {
       cancelSubscriptionAction({
         cancellationReason: {
           reasonCategory: "other",
+          reasonSubcategory: "billing_or_renewal",
           reasonDetails: "Done for now",
         },
       }),

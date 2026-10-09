@@ -1,21 +1,41 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
+import { createCheckoutNavigationDiagnostics } from "@/lib/billing/checkout-navigation-diagnostics";
 import { useAuth } from "@workos-inc/authkit-nextjs/components";
 import { toast } from "sonner";
+import { openSettingsDialog } from "@/lib/utils/settings-dialog";
 import {
   captureAuthenticatedEvent,
   getPostHogRequestHeaders,
   newCheckoutAttemptId,
 } from "@/lib/analytics/client";
 import {
+  PAID_FUNNEL_EVENTS,
   planLookupKeyToBillingInterval,
   planLookupKeyToTier,
   type PaidFunnelPlan,
 } from "@/lib/analytics/paid-funnel";
+import {
+  CHECKOUT_NAVIGATION_GUARD_WINDOW_MS,
+  getRecentCheckoutNavigation,
+  rememberCheckoutNavigation,
+} from "@/lib/billing/checkout-navigation-guard";
+import {
+  proMonthlyPricingExperimentProperties,
+  type ProMonthlyPricingExperimentPresentation,
+} from "@/lib/experiments/pro-monthly-pricing";
+
+// Keep a tab's upgrade ownership across pricing dialog remounts. Server routes
+// remain authoritative across page loads and tabs, including open-session reuse.
+let upgradeInFlight = false;
 
 export const useUpgrade = () => {
-  const { user } = useAuth();
+  const { user, organizationId } = useAuth();
   const [upgradeLoading, setUpgradeLoading] = useState(false);
-  const upgradeInFlightRef = useRef(false);
+  const [billingReviewScope, setBillingReviewScope] = useState<string | null>(
+    null,
+  );
+  const billingScope = `${user?.id ?? ""}:${organizationId ?? ""}`;
+  const billingReviewRequired = billingReviewScope === billingScope;
 
   const handleUpgrade = async (
     planKey?: PaidFunnelPlan,
@@ -27,12 +47,13 @@ export const useUpgrade = () => {
       surface?: string;
       reason?: string;
       limit_type?: string;
+      pricing_experiment?: ProMonthlyPricingExperimentPresentation;
     } = {},
   ) => {
     e?.preventDefault();
 
     // Prevent duplicate submits
-    if (upgradeInFlightRef.current) {
+    if (upgradeInFlight) {
       return;
     }
 
@@ -41,13 +62,48 @@ export const useUpgrade = () => {
       return;
     }
 
-    upgradeInFlightRef.current = true;
+    const selectedPlan = planKey || "pro-monthly-plan";
+    if (!currentSubscription || currentSubscription === "free") {
+      const recentNavigation = getRecentCheckoutNavigation({
+        plan: selectedPlan,
+      });
+      if (recentNavigation) {
+        captureAuthenticatedEvent(
+          PAID_FUNNEL_EVENTS.checkoutRedirectSuppressed,
+          {
+            checkout_attempt_id: recentNavigation.attemptId,
+            plan: selectedPlan,
+            from_tier: currentSubscription ?? "free",
+            to_tier: planLookupKeyToTier(selectedPlan),
+            billing_interval: planLookupKeyToBillingInterval(selectedPlan),
+            surface: analyticsContext.surface,
+            source: analyticsContext.source,
+            reason: analyticsContext.reason,
+            limit_type: analyticsContext.limit_type,
+            suppression_reason: "recent_navigation",
+            guard_window_ms: CHECKOUT_NAVIGATION_GUARD_WINDOW_MS,
+            ...proMonthlyPricingExperimentProperties(
+              analyticsContext.pricing_experiment,
+            ),
+          },
+        );
+        toast.info("Checkout is already opening", {
+          description: "Wait a moment before trying again.",
+        });
+        return;
+      }
+    }
+
+    upgradeInFlight = true;
     setUpgradeLoading(true);
 
     let navigationStarted = false;
+    let diagnostics:
+      ReturnType<typeof createCheckoutNavigationDiagnostics> | undefined;
+    let failureStage: "request_failed" | "navigation_exception" =
+      "request_failed";
 
     try {
-      const selectedPlan = planKey || "pro-monthly-plan";
       const checkoutAttemptId = newCheckoutAttemptId();
       const toTier = planLookupKeyToTier(selectedPlan);
       const billingInterval = planLookupKeyToBillingInterval(selectedPlan);
@@ -77,6 +133,12 @@ export const useUpgrade = () => {
 
       // Use regular checkout for new subscriptions (free users)
       if (!currentSubscription || currentSubscription === "free") {
+        diagnostics = createCheckoutNavigationDiagnostics({
+          attemptId: checkoutAttemptId,
+          plan: selectedPlan,
+          source: analyticsContext.source,
+          surface: analyticsContext.surface,
+        });
         captureAuthenticatedEvent("checkout_intent_clicked", {
           checkout_attempt_id: checkoutAttemptId,
           plan: selectedPlan,
@@ -89,6 +151,9 @@ export const useUpgrade = () => {
           reason: analyticsContext.reason,
           limit_type: analyticsContext.limit_type,
           checkout_type: "new_subscription",
+          ...proMonthlyPricingExperimentProperties(
+            analyticsContext.pricing_experiment,
+          ),
         });
 
         const res = await fetch("/api/subscribe", {
@@ -100,36 +165,72 @@ export const useUpgrade = () => {
           body: JSON.stringify(requestBody),
         });
 
-        const data = await res.json().catch(() => ({}));
+        diagnostics.responseReceived(res.status);
+        let invalidJson = false;
+        const data = await res.json().catch(() => {
+          invalidJson = true;
+          return {};
+        });
 
         if (!res.ok) {
+          diagnostics.failed("http_error", res.status);
+          if (data?.code === "recent_renewal_payment_needs_review") {
+            setBillingReviewScope(billingScope);
+            toast.error("Your previous subscription payment needs review", {
+              description:
+                "Open Account settings to update your card or get billing help.",
+              duration: Infinity,
+              action: {
+                label: "Review billing",
+                onClick: () => openSettingsDialog("Account"),
+              },
+            });
+            return;
+          }
           toast.error(
-            data.error || `Something went wrong (HTTP ${res.status})`,
+            data?.error || `Something went wrong (HTTP ${res.status})`,
           );
           return;
         }
 
-        const { error, url } = data;
+        if (invalidJson) {
+          diagnostics.failed("invalid_json", res.status);
+          toast.error("Unknown error creating checkout session");
+          return;
+        }
 
-        if (url) {
+        const { error, url, pricingExperiment } = data ?? {};
+
+        if (typeof url === "string" && url) {
+          failureStage = "navigation_exception";
+          diagnostics.navigationRequested();
+          window.location.href = url;
+          rememberCheckoutNavigation({
+            attemptId: checkoutAttemptId,
+            plan: selectedPlan,
+            startedAt: Date.now(),
+          });
           captureAuthenticatedEvent("checkout_redirected", {
             checkout_attempt_id: checkoutAttemptId,
             plan: selectedPlan,
             quantity,
             from_tier: currentSubscription ?? "free",
             to_tier: toTier,
-            billing_interval: billingInterval,
             surface: analyticsContext.surface,
             source: analyticsContext.source,
             reason: analyticsContext.reason,
             limit_type: analyticsContext.limit_type,
             checkout_type: "new_subscription",
+            ...proMonthlyPricingExperimentProperties(
+              pricingExperiment ?? analyticsContext.pricing_experiment,
+            ),
+            billing_interval: billingInterval,
           });
-          window.location.href = url;
           navigationStarted = true;
           return;
         }
 
+        diagnostics.failed("missing_checkout_url", res.status);
         if (error) {
           toast.error(`Error: ${error}`);
         } else {
@@ -198,6 +299,7 @@ export const useUpgrade = () => {
         }
       }
     } catch (err) {
+      diagnostics?.failed(failureStage);
       // Surface real error messages when err is an Error
       if (err instanceof Error) {
         toast.error(err.message);
@@ -206,7 +308,7 @@ export const useUpgrade = () => {
       }
     } finally {
       if (!navigationStarted) {
-        upgradeInFlightRef.current = false;
+        upgradeInFlight = false;
         setUpgradeLoading(false);
       }
     }
@@ -215,5 +317,7 @@ export const useUpgrade = () => {
   return {
     upgradeLoading,
     handleUpgrade,
+    billingReviewRequired,
+    clearBillingReview: () => setBillingReviewScope(null),
   };
 };

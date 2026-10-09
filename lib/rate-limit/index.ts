@@ -1,3 +1,4 @@
+import type { FreeLimitPolicy } from "./free-config";
 /**
  * Rate Limiting Module
  *
@@ -6,13 +7,13 @@
  * 1. Token Bucket (Paid users - Pro, Pro+, Ultra, Team):
  *    - Used for both Agent and Ask modes (shared budget)
  *    - Points consumed based on token usage costs
- *    - Single monthly bucket: credits = subscription price, refills every 30 days
+ *    - Monthly paid cycles refresh once per paid invoice; annual plans use 30-day windows
  *    - Supports extra usage (prepaid balance) when limits exceeded
  *
  * 2. Fixed Window (Free users):
  *    - Shared request-unit counting within a daily fixed window (resets at midnight UTC)
  *    - Ask mode costs 1 unit
- *    - Agent mode (local sandbox only) costs 2 units
+ *    - Agent mode (local sandbox only) costs 1 unit
  *    - Default free budget: 10 units/day (FREE_RATE_LIMIT_REQUESTS)
  */
 
@@ -25,6 +26,7 @@ import type {
 } from "@/types";
 import { canUseExtraUsage } from "@/types";
 import { ChatSDKError } from "@/lib/errors";
+import { getLimitPressureContext } from "@/lib/limit-pressure";
 
 // Re-export token bucket functions
 export {
@@ -45,6 +47,7 @@ export {
   clearOrgRemovedUsage,
   applyTeamSeatDebt,
   billableCostDollarsToPoints,
+  calculateRawModelUsageCostDollars,
   calculateTokenCost,
   calculateRawTokenCost,
   getBudgetLimits,
@@ -54,6 +57,7 @@ export {
   POINTS_PER_DOLLAR,
   type UsageDeductionFailureReason,
   type UsageDeductionResult,
+  type UsageRefundResult,
   type CycleAllocationCapResult,
   type BillingCreditTransitionIdentity,
   type DelinquencyCreditHoldResult,
@@ -76,6 +80,7 @@ export {
 // Re-export utilities
 export { createRedisClient, formatTimeRemaining } from "./redis";
 export { UsageRefundTracker } from "./refund";
+export { isHandledUserRateLimitError } from "./error-classification";
 export {
   addUsageDeductionDelta,
   createUsageSettlementState,
@@ -92,16 +97,13 @@ export {
 } from "./free-monthly-cost";
 export {
   getPaidDailyFreeAllowanceStatus,
+  hasPaidDailyFreeAllowanceConsent,
   reservePaidDailyFreeAllowanceRequest,
   recordPaidDailyFreeAllowanceCost,
   paidDailyFreeAllowanceStatusToMetadata,
   getPaidDailyFreeAllowanceKeys,
-  getPaidDailyFreeAllowanceRolloutPercent,
-  getPaidDailyFreeAllowanceRequestsPerDay,
   getPaidDailyFreeAllowanceCostLimitDollars,
   PAID_DAILY_FREE_ALLOWANCE_COST_LIMIT_USD_DEFAULT,
-  PAID_DAILY_FREE_ALLOWANCE_REQUESTS_PER_DAY_DEFAULT,
-  PAID_DAILY_FREE_ALLOWANCE_ROLLOUT_PERCENT_DEFAULT,
   type PaidDailyFreeAllowanceMetadata,
   type PaidDailyFreeAllowanceReservation,
   type PaidDailyFreeAllowanceStatus,
@@ -141,15 +143,16 @@ export const checkRateLimit = async (
   modelName?: string,
   organizationId?: string,
   freeQuotaSubject?: string,
+  freeLimits?: FreeLimitPolicy,
 ): Promise<RateLimitInfo> => {
   // Free users: fixed daily window
   if (subscription === "free") {
     const quotaSubject = freeQuotaSubject ?? userId;
     if (isAgentMode(mode)) {
-      // Free agent mode shares the daily free budget and consumes 2 units.
-      return checkFreeAgentRateLimit(quotaSubject);
+      // Free agent mode shares the daily free budget and consumes 1 unit.
+      return checkFreeAgentRateLimit(quotaSubject, freeLimits);
     }
-    return checkFreeUserRateLimit(quotaSubject);
+    return checkFreeUserRateLimit(quotaSubject, undefined, freeLimits);
   }
 
   // Paid users: token bucket (same budget for both modes)
@@ -175,12 +178,13 @@ export const checkRateLimitCapacity = async (
   modelName?: string,
   organizationId?: string,
   freeQuotaSubject?: string,
+  freeLimits?: FreeLimitPolicy,
 ): Promise<RateLimitInfo> => {
   if (subscription === "free") {
     const quotaSubject = freeQuotaSubject ?? userId;
     return isAgentMode(mode)
-      ? checkFreeAgentRateLimitCapacity(quotaSubject)
-      : checkFreeUserRateLimitCapacity(quotaSubject);
+      ? checkFreeAgentRateLimitCapacity(quotaSubject, freeLimits)
+      : checkFreeUserRateLimitCapacity(quotaSubject, undefined, freeLimits);
   }
 
   const current = await checkTokenBucketLimit(
@@ -198,5 +202,13 @@ export const checkRateLimitCapacity = async (
   throw new ChatSDKError(
     "rate_limit:chat",
     "Your current usage limit no longer allows this approved operation. Start a new Agent request after your limit resets or add extra usage credits.",
+    {
+      subscription,
+      capReason: "monthly_exhausted",
+      ...getLimitPressureContext({
+        subscription,
+        capReason: "monthly_exhausted",
+      }),
+    },
   );
 };

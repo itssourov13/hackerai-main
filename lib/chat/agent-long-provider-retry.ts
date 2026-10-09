@@ -1,4 +1,6 @@
 import { hasMeaningfulToolInput } from "@/lib/chat/tool-abort-utils";
+import { OUTPUT_LIMIT_FINISH_REASON } from "@/lib/chat/stop-conditions";
+import { isStaticToolUIPart, type UIMessage } from "ai";
 
 type MessagePartLike = {
   type?: unknown;
@@ -12,6 +14,8 @@ type MessagePartLike = {
 
 type RetryDecisionOptions = {
   hasTerminalProviderStreamError: boolean;
+  finishReason?: string;
+  providerContentBlocked?: boolean;
   stoppedDueToDoomLoop?: boolean;
   stoppedDueToAssistantContentLoop?: boolean;
   detectAssistantContentLoop?: boolean;
@@ -82,6 +86,165 @@ const hasToolOutputOrError = (part: unknown): boolean => {
   );
 };
 
+const isCompletedToolPart = (part: unknown): boolean =>
+  isToolPart(part) && hasToolOutputOrError(part);
+
+const hasDurableAssistantPart = (parts: unknown[]): boolean =>
+  parts.some((part) => {
+    const type = getPartType(part);
+    if (type === "text") return Boolean(getPartText(part)?.trim());
+    return isCompletedToolPart(part);
+  });
+
+export const getProviderOutputDiagnostics = (parts: unknown[]) => ({
+  part_count: parts.length,
+  completed_tool_count: parts.filter(isCompletedToolPart).length,
+  has_durable_output: hasDurableAssistantPart(parts),
+  has_step_boundary: parts.some((part) => getPartType(part) === "step-start"),
+});
+
+/** Shared eligibility and skip reason so telemetry cannot drift from behavior. */
+export function decideProviderRecovery(options: {
+  userCancelled: boolean;
+  unrecoverableVision: boolean;
+  alreadyRetried: boolean;
+  streamAborted: boolean;
+  loopRecovery: boolean;
+  hasCandidate: boolean;
+  modelEligible: boolean;
+}) {
+  const reason = options.userCancelled
+    ? "user_cancelled"
+    : options.unrecoverableVision
+      ? "vision_recovery_unavailable"
+      : options.alreadyRetried
+        ? "retry_budget_exhausted"
+        : options.streamAborted && !options.loopRecovery
+          ? "stream_aborted"
+          : !options.hasCandidate
+            ? "no_safe_recovery"
+            : !options.modelEligible
+              ? "model_not_eligible"
+              : "eligible";
+  return { attempt: reason === "eligible", reason };
+}
+
+export type ProviderDisconnectContinuation = {
+  messages: UIMessage[];
+  removedPartCount: number;
+  preservedCompletedToolCount: number;
+  preservedUnknownToolCount: number;
+  preservedTextPartCount: number;
+};
+
+const DEEPSEEK_PRO_MODEL = "model-deepseek-v4-pro-0813";
+const DEEPSEEK_PRO_RECOVERY_CHAIN = ["model-glm-5.3", "model-kimi-k3"] as const;
+
+/**
+ * Return the next bounded app-side recovery model for a DeepSeek Pro stream
+ * disconnect. `completedRetryCount` counts retries already started, so the
+ * only valid transitions are DeepSeek -> GLM -> Kimi.
+ */
+export const getNextDeepSeekProDisconnectRetryModel = ({
+  originalModel,
+  failedModel,
+  completedRetryCount,
+}: {
+  originalModel: string;
+  failedModel: string;
+  completedRetryCount: number;
+}): (typeof DEEPSEEK_PRO_RECOVERY_CHAIN)[number] | undefined => {
+  if (originalModel !== DEEPSEEK_PRO_MODEL) return undefined;
+
+  if (completedRetryCount === 0 && failedModel === DEEPSEEK_PRO_MODEL) {
+    return DEEPSEEK_PRO_RECOVERY_CHAIN[0];
+  }
+
+  if (
+    completedRetryCount === 1 &&
+    failedModel === DEEPSEEK_PRO_RECOVERY_CHAIN[0]
+  ) {
+    return DEEPSEEK_PRO_RECOVERY_CHAIN[1];
+  }
+
+  return undefined;
+};
+
+/**
+ * Build a replay-safe transcript after a provider socket dies mid-step.
+ *
+ * AI SDK agent output uses `step-start` boundaries. Everything before the
+ * final boundary belongs to completed model/tool steps and is safe to retain.
+ * The final step is incomplete even when the provider adapter closes its text
+ * part during error cleanup, so it must not be treated as durable. A completed
+ * tool result is the exception: preserve it and trim only the tail after it so
+ * a continuation cannot repeat an already-executed side effect.
+ */
+export const prepareProviderDisconnectContinuation = (
+  messages: UIMessage[],
+  { allowCompletedTail = false }: { allowCompletedTail?: boolean } = {},
+): ProviderDisconnectContinuation | undefined => {
+  const assistantIndex = messages.findLastIndex(
+    (message) => message.role === "assistant",
+  );
+  if (assistantIndex < 0) return undefined;
+
+  const assistant = messages[assistantIndex];
+  const parts = assistant.parts ?? [];
+  const lastStepStartIndex = parts.findLastIndex(
+    (part) => getPartType(part) === "step-start",
+  );
+  if (lastStepStartIndex < 0) return undefined;
+
+  const lastCompletedToolIndex = parts.findLastIndex(isCompletedToolPart);
+  const preserveUntil = Math.max(
+    lastStepStartIndex,
+    lastCompletedToolIndex >= lastStepStartIndex
+      ? lastCompletedToolIndex + 1
+      : lastStepStartIndex,
+  );
+  const removedPartCount = parts.length - preserveUntil;
+  if (removedPartCount <= 0 && !allowCompletedTail) return undefined;
+
+  const preservedParts = parts.slice(0, preserveUntil);
+  let preservedUnknownToolCount = 0;
+  // Parallel tools can leave an unfinished call before a completed sibling.
+  // Keep its identity with an explicit unknown outcome: dropping it loses the
+  // execution record, while retaining input-available breaks the next request.
+  const continuationParts = preservedParts.map((part) => {
+    if (
+      !isStaticToolUIPart(part) ||
+      part.state !== "input-available" ||
+      part.providerExecuted === true
+    )
+      return part;
+    preservedUnknownToolCount++;
+    return {
+      ...part,
+      state: "output-error" as const,
+      errorText:
+        "The provider stream ended before this tool's result was received; its execution outcome is unknown. Verify its effects before considering another execution.",
+    };
+  });
+  const normalizedMessages = messages.slice(0, assistantIndex);
+  if (hasDurableAssistantPart(continuationParts)) {
+    normalizedMessages.push({ ...assistant, parts: continuationParts });
+  }
+  normalizedMessages.push(...messages.slice(assistantIndex + 1));
+
+  return {
+    messages: normalizedMessages,
+    removedPartCount,
+    preservedCompletedToolCount:
+      preservedParts.filter(isCompletedToolPart).length,
+    preservedUnknownToolCount,
+    preservedTextPartCount: preservedParts.filter(
+      (part) =>
+        getPartType(part) === "text" && Boolean(getPartText(part)?.trim()),
+    ).length,
+  };
+};
+
 const isRestartableInterruptedToolInput = (part: unknown): boolean => {
   if (!isToolPart(part) || !part || typeof part !== "object") return false;
   const candidate = part as MessagePartLike;
@@ -109,6 +272,7 @@ const isFallbackSafeProviderPart = (part: unknown): boolean => {
   return (
     type === "step-start" ||
     type === "reasoning" ||
+    (type === "text" && !getPartText(part)?.trim()) ||
     (type != null && FALLBACK_SAFE_METADATA_PART_TYPES.has(type))
   );
 };
@@ -119,6 +283,9 @@ const hasReasoningPart = (parts: unknown[]): boolean =>
 const isReasoningOnlyProviderOutput = (parts: unknown[]): boolean =>
   parts.length > 0 &&
   hasReasoningPart(parts) &&
+  parts.every(isFallbackSafeProviderPart);
+
+const isOutputLimitWithoutDurableOutput = (parts: unknown[]): boolean =>
   parts.every(isFallbackSafeProviderPart);
 
 const isInterruptedToolInputOnlyProviderOutput = (parts: unknown[]): boolean =>
@@ -240,10 +407,47 @@ export const createAssistantContentLoopMonitor = () => {
   };
 };
 
+export const shouldRetryProviderStreamAfterReasoningOnlyOutput = (
+  parts: unknown[],
+  options: Pick<RetryDecisionOptions, "hasTerminalProviderStreamError">,
+): boolean =>
+  options.hasTerminalProviderStreamError &&
+  isReasoningOnlyProviderOutput(parts);
+
+export const shouldRetryProviderStreamAfterNonDurableOutputLimit = (
+  parts: unknown[],
+  options: Pick<RetryDecisionOptions, "finishReason">,
+): boolean =>
+  options.finishReason === OUTPUT_LIMIT_FINISH_REASON &&
+  isOutputLimitWithoutDurableOutput(parts);
+
 export const shouldRetryProviderStreamWithFallback = (
   parts: unknown[],
   options: RetryDecisionOptions,
 ): boolean => {
+  // Provider content filters are model-specific. Retry the run once with the
+  // configured fallback model; the caller's bounded retry guard keeps a second
+  // content-filter finish terminal.
+  if (options.providerContentBlocked) return true;
+
+  // An HTTP rejection can arrive via streamText.onError without emitting a
+  // step-start. Metadata/empty text is also non-durable and safe to retry.
+  if (
+    options.hasTerminalProviderStreamError &&
+    parts.every(isFallbackSafeProviderPart)
+  )
+    return true;
+
+  // A provider can consume the entire output allowance as hidden reasoning
+  // and return no text or completed tool call. Treat that as a failed model
+  // leg so Auto can make one bounded fallback attempt instead of persisting a
+  // successful-looking empty response. Output-bearing turns are deliberately
+  // excluded: their text and completed tool effects must be saved, and the
+  // existing bounded continuation keeps the user's selected model.
+  if (shouldRetryProviderStreamAfterNonDurableOutputLimit(parts, options)) {
+    return true;
+  }
+
   // Preserve the older guard for streams that never got past the first step.
   if (isOnlyStepStart(parts)) return true;
 
@@ -265,8 +469,8 @@ export const shouldRetryProviderStreamWithFallback = (
   // is no text, tool call, or tool output to preserve. Retrying on fallback is
   // safer than failing the whole run on a discarded provider socket.
   return (
-    options.hasTerminalProviderStreamError &&
-    (isReasoningOnlyProviderOutput(parts) ||
+    shouldRetryProviderStreamAfterReasoningOnlyOutput(parts, options) ||
+    (options.hasTerminalProviderStreamError &&
       isInterruptedToolInputOnlyProviderOutput(parts))
   );
 };
@@ -280,3 +484,6 @@ export const shouldRetryProviderStreamAfterInterruptedToolInput = (
 ): boolean =>
   options.hasTerminalProviderStreamError &&
   isInterruptedToolInputOnlyProviderOutput(parts);
+
+export const PROVIDER_DISCONNECT_CONTINUATION_PROMPT =
+  "The previous model connection ended mid-response. Continue from the preserved completed text and tool results. Do not repeat completed tool calls or their side effects. Finish the task from the last durable result.";

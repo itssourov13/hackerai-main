@@ -17,10 +17,18 @@ describe("useChatHandlers chat action contracts", () => {
       "regenerate response",
       "retry response",
       "regenerate edited message",
-      "continue response",
       "send queued message",
     ]) {
       expect(useChatHandlersSrc).toContain(`runChatAction("${description}"`);
     }
+  });
+
+  it("blocks unavailable local attachments instead of sending text-only", () => {
+    expect(useChatHandlersSrc).toContain(
+      'toast.error("Local attachment is unavailable"',
+    );
+    expect(useChatHandlersSrc).toMatch(
+      /hasUnavailableLocalFiles[\s\S]*return false;[\s\S]*const hasValidFiles/,
+    );
   });
 });

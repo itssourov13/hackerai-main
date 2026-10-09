@@ -1,20 +1,36 @@
 import { tool } from "ai";
 import { z } from "zod";
 
-export const toolBriefSchema = z
-  .string()
-  .optional()
-  .describe(
-    "Optional display metadata. Include a concise one-sentence preamble whenever possible so the user understands the operation; if omitted, HackerAI will show a generated fallback label.",
-  );
+type ModelAwareToolSchemaOptions = {
+  modelName?: string;
+};
+
+const usesDeepSeekToolBrief = (modelName?: string): boolean =>
+  modelName?.includes("deepseek") === true;
+
+export const createToolBriefSchema = ({
+  modelName,
+}: ModelAwareToolSchemaOptions = {}) =>
+  z
+    .string()
+    .optional()
+    .describe(
+      usesDeepSeekToolBrief(modelName)
+        ? "Required display metadata for this model. Always provide a concise one-sentence English preamble so the user understands the operation. Write it in English only, never Chinese or another language."
+        : "Optional display metadata. Include a concise one-sentence preamble whenever possible so the user understands the operation; if omitted, HackerAI will show a generated fallback label.",
+    );
+
+export const toolBriefSchema = createToolBriefSchema();
 
 export const RUN_TERMINAL_DEFAULT_STREAM_TIMEOUT_SECONDS = 60;
 export const RUN_TERMINAL_MAX_TIMEOUT_SECONDS = 600;
 
 export const createRunTerminalCmdToolSchema = ({
   approvalGated = false,
+  modelName,
 }: {
   approvalGated?: boolean;
+  modelName?: string;
 } = {}) => {
   const commandCompositionGuidance = approvalGated
     ? `1. Prefer one static command per tool call so a safe argv prefix can be approved and reused:
@@ -46,21 +62,21 @@ Commands run in the selected sandbox environment.${approvalGated ? " The platfor
 ${approvalGated ? "For every approval-gated command, provide a concise, user-facing justification describing the intended outcome; HackerAI displays it in the approval prompt, so do not merely repeat the command. prefix_rule is optional: provide it only for a narrow, useful category of similar commands the user can safely approve for this conversation. It must be an exact argv prefix represented as separate array elements. Prefer a stable safe prefix over copying the complete command, and omit it when no reusable scope is appropriate. Never provide prefix_rule for destructive commands, shell wrappers, compound commands, redirects, substitutions, environment assignments, wildcards, or other dynamic shell syntax." : ""}
 In using these tools, adhere to the following guidelines:
 ${commandCompositionGuidance}
-2. NEVER run code directly via interpreter inline commands (like \`python3 -c "..."\` or \`node -e "..."\`). ALWAYS save code to a file first, then execute the file.
+2. NEVER run code directly via interpreter inline commands (like \`python3 -c "..."\` or \`node -e "..."\`). ALWAYS save code to a file first, then execute the file. If the file tool reports a transport failure, reconnect the Desktop app before retrying. Never substitute a terminal write to bypass a rejected file operation or project-root boundary. A timeout or lost response may hide a completed write: inspect the file before retrying, especially before append.
 3. For ANY commands that would require user interaction, ASSUME THE USER IS NOT AVAILABLE TO INTERACT and PASS THE NON-INTERACTIVE FLAGS (e.g. --yes for npx).
 ${pagerGuidance}
-5. For commands that are long running/expected to run indefinitely until interruption, please run them in the background. To run jobs in the background, set \`is_background\` to true rather than changing the details of the command. EXCEPTION: Never use background mode if you plan to retrieve the output file immediately afterward.
+5. For long-running commands whose output or completion you need to monitor, keep \`is_background\` false. If the result says \`Process running with session ID X\`, continue it with \`interact_terminal_session\` using that exact session ID. Use \`is_background\` true only for detached jobs whose output and completion you do not need to poll; a detached PID is not a reusable terminal session.
 6. Dont include any newlines in the command.
 ${largeOutputGuidance}
 8. Install missing tools when needed: Use \`apt install tool\` or \`pip install package\` (no sudo needed in container).
 9. After creating files that the user needs (reports, scan results, generated documents), use the get_terminal_files tool to share them as downloadable attachments.
-10. For pentesting tools, always use time-efficient flags and targeted scans to keep execution under 7 minutes (e.g., targeted ports for nmap, small wordlists for fuzzing, specific templates for nuclei, vulnerable-only enumeration for wpscan). Timeout handling: On timeout -> reduce scope, break into smaller operations.
+10. Choose scope and execution intensity from the user's objective, target behavior, and available resources. Adapt when errors, throttling, or diminishing returns appear. Preserve useful progress and inspect existing sessions, execution records, and artifacts before repeating work. A wait expiring is not a process failure: continue the returned session. Finish when the requested outcome is supported by evidence, and state any remaining uncertainty.
 11. When users make vague requests (e.g., "do recon", "scan this", "check security"), start with fast, lightweight tools and quick scans to provide initial results quickly. Use comprehensive/deep scans only when explicitly requested or after initial findings warrant deeper investigation.
 12. When searching for text in files, prefer using \`rg\` (ripgrep) because it is much faster than alternatives like \`grep\`. When searching for files by name, prefer \`rg --files\` or \`find\`. If the \`rg\` command is not found, fall back to \`grep\` or \`find\`.
    - To read files, prefer the file tool over \`cat\`/\`head\`/\`tail\` when practical.`,
     inputSchema: z.object({
       command: z.string().describe("The shell command to execute"),
-      brief: toolBriefSchema,
+      brief: createToolBriefSchema({ modelName }),
       ...(approvalGated
         ? {
             justification: z
@@ -92,7 +108,7 @@ ${largeOutputGuidance}
         .optional()
         .default(RUN_TERMINAL_DEFAULT_STREAM_TIMEOUT_SECONDS)
         .describe(
-          `Timeout in seconds to wait for command output before returning. A quiet foreground command that is still running returns a reusable opaque session ID for interact_terminal_session; copy that returned session exactly and never derive one from its PID. Noisy foreground commands that already produced truncated output may be terminated to protect the session. Capped at ${RUN_TERMINAL_MAX_TIMEOUT_SECONDS} seconds. Defaults to ${RUN_TERMINAL_DEFAULT_STREAM_TIMEOUT_SECONDS} seconds.`,
+          `Time in seconds to wait for command output before returning; reaching this limit does not terminate the process. A foreground command that is still running returns a reusable opaque session ID for interact_terminal_session; copy it exactly and never derive one from a PID. Captured output is retained in a bounded execution record when available. Explicit cancellation and infrastructure resource limits can still stop execution. Capped at ${RUN_TERMINAL_MAX_TIMEOUT_SECONDS} seconds. Defaults to ${RUN_TERMINAL_DEFAULT_STREAM_TIMEOUT_SECONDS} seconds.`,
         ),
       interactive: z
         .boolean()
@@ -110,8 +126,11 @@ export const runTerminalCmdTool = createRunTerminalCmdToolSchema();
 export const INTERACT_TERMINAL_DEFAULT_WAIT_TIMEOUT_SECONDS = 10;
 export const INTERACT_TERMINAL_MAX_WAIT_TIMEOUT_SECONDS = 300;
 
-export const interactTerminalSessionTool = tool({
-  description: `Interact with persistent shell sessions in the sandbox environment.
+export const createInteractTerminalSessionToolSchema = ({
+  modelName,
+}: ModelAwareToolSchemaOptions = {}) =>
+  tool({
+    description: `Interact with persistent shell sessions in the sandbox environment.
 
 <supported_actions>
 - \`view\`: View the content of a shell session
@@ -121,12 +140,13 @@ export const interactTerminalSessionTool = tool({
 </supported_actions>
 
 <instructions>
-- Only call this tool when the preceding \`run_terminal_cmd\` result contains an explicit \`session\` field; copy that value exactly
+- Use the exact \`session\` returned by \`run_terminal_cmd\`, including a session preserved in conversation context; never invent an ID
+- Across turns, \`view\` or \`wait\` can retrieve a historical execution record when the live session has closed. Check its status, saved output, and artifacts before repeating work. A historical record cannot accept input or be killed; a last-recorded running state does not prove the process is still alive.
 - A PID is not a session ID. Never derive a session from a PID (for example, never turn PID 1689 into \`cmd-1689\`)
 - Input-capable sessions are created with \`interactive=true\`; timed-out foreground commands may return non-interactive sessions that support wait/view/kill but not send
 - When using \`view\` action, ensure command has completed execution before using its output
 - Set a short \`timeout\` (such as 5s) on \`wait\` for processes that don't return promptly to avoid meaningless waiting time
-- Processes are NEVER killed on timeout - they keep running in the session; \`timeout\` only controls how long to wait for output before returning
+- The output wait does not kill processes; explicit cancellation, response cleanup, and infrastructure resource limits can close live sessions. Saved records remain available while the original sandbox and retention allow.
 - Use \`wait\` action when a process needs additional time to complete and return
 - Only use \`wait\` after \`send\`, or after \`run_terminal_cmd\` returned without finishing and included an explicit \`session\` field; decide whether to wait based on the prior output
 - DO NOT use \`wait\` for long-running daemon processes
@@ -146,52 +166,63 @@ export const interactTerminalSessionTool = tool({
 - Use \`kill\` to stop background processes that are no longer needed
 - Use \`kill\` to clean up dead or unresponsive processes
 </recommended_usage>`,
-  inputSchema: z.object({
-    action: z
-      .enum(["view", "wait", "send", "kill"])
-      .describe("The action to perform"),
-    brief: toolBriefSchema,
-    input: z
-      .string()
-      .optional()
-      .describe(
-        'Input text to send to the interactive session. Required for `send`. Sent verbatim - without a trailing \\n (or `Enter`) the line is typed but NOT submitted, and a subsequent `send` will append to the same line. To submit just Enter, pass `"Enter"` or `"\\n"`.',
-      ),
-    session: z
-      .string()
-      .describe(
-        "The exact opaque session identifier explicitly returned by run_terminal_cmd. Never pass a PID or construct a session identifier yourself.",
-      ),
-    timeout: z
-      .number()
-      .int()
-      .optional()
-      .default(INTERACT_TERMINAL_DEFAULT_WAIT_TIMEOUT_SECONDS)
-      .describe(
-        `Timeout in seconds to wait for output. Only used for \`wait\` action. Defaults to ${INTERACT_TERMINAL_DEFAULT_WAIT_TIMEOUT_SECONDS} seconds. Max ${INTERACT_TERMINAL_MAX_WAIT_TIMEOUT_SECONDS} seconds.`,
-      ),
-  }),
-});
+    inputSchema: z.object({
+      action: z
+        .enum(["view", "wait", "send", "kill"])
+        .describe("The action to perform"),
+      brief: createToolBriefSchema({ modelName }),
+      input: z
+        .string()
+        .optional()
+        .describe(
+          'Input text to send to the interactive session. Required for `send`. Sent verbatim - without a trailing \\n (or `Enter`) the line is typed but NOT submitted, and a subsequent `send` will append to the same line. To submit just Enter, pass `"Enter"` or `"\\n"`.',
+        ),
+      session: z
+        .string()
+        .describe(
+          "The exact opaque session identifier explicitly returned by run_terminal_cmd. Never pass a PID or construct a session identifier yourself.",
+        ),
+      timeout: z
+        .number()
+        .int()
+        .optional()
+        .default(INTERACT_TERMINAL_DEFAULT_WAIT_TIMEOUT_SECONDS)
+        .describe(
+          `Timeout in seconds to wait for output. Only used for \`wait\` action. Defaults to ${INTERACT_TERMINAL_DEFAULT_WAIT_TIMEOUT_SECONDS} seconds. Max ${INTERACT_TERMINAL_MAX_WAIT_TIMEOUT_SECONDS} seconds.`,
+        ),
+    }),
+  });
 
-export const getTerminalFilesTool = tool({
-  description: `Share files from the terminal sandbox with the user as downloadable attachments.
+export const interactTerminalSessionTool =
+  createInteractTerminalSessionToolSchema();
+
+export const createGetTerminalFilesToolSchema = ({
+  modelName,
+}: ModelAwareToolSchemaOptions = {}) =>
+  tool({
+    description: `Share files from the terminal sandbox with the user as downloadable attachments.
 
 Usage:
 - Use this tool when the user requests files or needs to download results from the sandbox
 - Provide full file paths (e.g., /home/user/output.txt, /home/user/scan-results.xml)
 - Files are automatically uploaded and made available for download
+- Paths belong to the selected Cloud, Desktop, or remote computer; Cloud files are not already on the user's computer
+- Before sharing a runnable package, verify the exact archive from a fresh extraction when the required environment is available; otherwise report the verification blocker
+- deliveryReceipts confirm storage, not that a package runs or satisfies the requested behavior
 - Files larger than 250 MB cannot be shared; reduce, split, or exclude bulky generated/dependency directories before sharing
 - Use this after generating reports, saving scan results, or creating any files the user needs to access
 - Multiple files can be shared in a single call`,
-  inputSchema: z.object({
-    brief: toolBriefSchema,
-    files: z
-      .array(z.string())
-      .describe(
-        "Array of file paths to provide as attachments to the user. Use full paths like /home/user/output.txt",
-      ),
-  }),
-});
+    inputSchema: z.object({
+      brief: createToolBriefSchema({ modelName }),
+      files: z
+        .array(z.string())
+        .describe(
+          "Array of file paths to provide as attachments to the user. Use full paths like /home/user/output.txt",
+        ),
+    }),
+  });
+
+export const getTerminalFilesTool = createGetTerminalFilesToolSchema();
 
 export const FILE_ACTIONS_WITH_VIEW = [
   "view",
@@ -224,9 +255,11 @@ const fileEditSchema = z.object({
 export const createFileToolSchema = ({
   supportsView,
   approvalGated = false,
+  modelName,
 }: {
   supportsView: boolean;
   approvalGated?: boolean;
+  modelName?: string;
 }) => {
   const actionSchema = (
     supportsView
@@ -261,11 +294,12 @@ export const createFileToolSchema = ({
           "Use 'read' for text-based or line-oriented formats.",
           "This model cannot view sandbox images directly; ask the user to select a model with image viewing support.",
         ]),
-    "Code MUST be saved to a file using this tool before execution via the shell tool.",
+    "Save code with this tool before execution via the shell tool. If this tool reports a transport failure, reconnect the Desktop app before retrying. Never substitute a terminal write to bypass a rejected file operation or project-root boundary. Verify the existing file before retrying a mutation whose result is unknown.",
     "DO NOT write partial or truncated content; always output the full content.",
     "'edit' can make multiple targeted replacements at once; all must succeed or none are applied.",
     "For extensive modifications to shorter files, use 'write' to rewrite the entire file instead of 'edit'.",
     "Under read action, the range parameter represents line number ranges (1-indexed, -1 for end of file).",
+    "Text content returned by this tool may prefix each line using the right-aligned, six-character LINE_NUMBER|LINE_CONTENT format. Treat LINE_NUMBER| as metadata, not as part of the file content.",
     "If the range parameter is not specified, the entire file will be read by default.",
     "Oversized files are not loaded in full; read will return file metadata and range guidance instead.",
     "DO NOT use the range parameter when reading a file for the first time; if the content is too long and gets truncated, the result will include range hints.",
@@ -293,7 +327,7 @@ ${instructionsDescription}`,
     inputSchema: z.object({
       action: actionSchema.describe("The action to perform"),
       path: z.string().describe("The absolute path to the target file"),
-      brief: toolBriefSchema,
+      brief: createToolBriefSchema({ modelName }),
       text: z
         .string()
         .optional()
@@ -321,7 +355,7 @@ export const todoWriteToolInputSchema = z.object({
   merge: z
     .boolean()
     .describe(
-      "Whether to merge the todos with the existing todos. If true, the todos will be merged into the existing todos based on the id field. You can leave unchanged properties undefined. If false, the new todos will replace the existing todos.",
+      "Whether to merge the todos with the existing todos. If true, the todos will be merged into the existing todos based on the id field. You can leave unchanged properties undefined. If false, replace the assistant plan; every unfinished task must be included. Prefer true for follow-ups. With true and todos=[], read current state without changing it.",
     ),
   todos: z
     .array(
@@ -340,9 +374,8 @@ export const todoWriteToolInputSchema = z.object({
           .describe("The current status of the todo item"),
       }),
     )
-    .min(1)
     .describe(
-      "Array of todo items to write to the workspace. For merge=false, new items should include content and status and replace the assistant-generated plan while preserving manually created todos. Partial items are treated as merge-style updates. For merge=true, existing items may be patched with partial updates, but new items should include content and status.",
+      "Array of todo items to write to the workspace. Use merge=true and todos=[] to read the full current list without writing. For merge=false, new items should include content and status and replace the assistant-generated plan while preserving manually created todos. Replacement is rejected if it omits unfinished assistant tasks; keep them, or explicitly update their status when genuinely finished or obsolete. Partial items are treated as merge-style updates. For merge=true, existing items may be patched with partial updates, but new items should include content and status. A new item whose exact normalized content matches an earlier new item in the same write or a preserved manual todo is skipped and reported by ID.",
     ),
 });
 
@@ -358,7 +391,7 @@ Use proactively for:
 2. Non-trivial vulnerability testing requiring systematic approach
 3. User explicitly requests todo list
 4. User provides multiple targets or attack vectors (numbered/comma-separated)
-5. After receiving new instructions - capture requirements as todos (use merge=false to replace the assistant plan, or merge=true to patch the current plan)
+5. After receiving new instructions - use merge=true to add or patch requirements while retaining unfinished work. Use merge=false only for an intentional complete replan.
 6. After completing tasks - mark complete with merge=true and add follow-ups
 7. When starting new tasks - mark as in_progress (ideally only one at a time)
 
@@ -459,6 +492,9 @@ NEVER INCLUDE THESE IN TODOS: basic enumeration steps; reading tool output; rout
   - Mark complete IMMEDIATELY after finishing
   - Only ONE task in_progress at a time
   - Complete current tasks before starting new ones
+  - Keep unfinished work pending or in_progress across turns, pauses, limits, and summarization. Never cancel work just to finish a turn or because its context is missing.
+  - Cancel only when a user scope change or confirmed obsolescence makes the task irrelevant; explain the reason to the user. Mark completed only after verifying the work.
+  - If IDs or the plan are unclear, read the current list with merge=true and todos=[] before updating. Never guess IDs.
 
 3. **Task Breakdown:**
   - Create specific, actionable security tests
@@ -481,23 +517,31 @@ const webSearchQuerySchema = z
   .min(1)
   .max(PERPLEXITY_QUERY_MAX_LENGTH);
 
-export const webSearchToolInputSchema = z.object({
-  queries: z
-    .array(webSearchQuerySchema)
-    .min(1)
-    .max(3)
-    .describe(
-      "MAXIMUM 3 non-empty query variants (1-3 items only). Express the same search intent with different wording.",
-    ),
-  time: z
-    .enum(["all", "past_day", "past_week", "past_month", "past_year"])
-    .optional()
-    .describe("Optional time filter to limit results to a recent time range"),
-  brief: toolBriefSchema,
-});
+export const createWebSearchToolInputSchema = ({
+  modelName,
+}: ModelAwareToolSchemaOptions = {}) =>
+  z.object({
+    queries: z
+      .array(webSearchQuerySchema)
+      .min(1)
+      .max(3)
+      .describe(
+        "MAXIMUM 3 non-empty query variants (1-3 items only). Express the same search intent with different wording.",
+      ),
+    time: z
+      .enum(["all", "past_day", "past_week", "past_month", "past_year"])
+      .optional()
+      .describe("Optional time filter to limit results to a recent time range"),
+    brief: createToolBriefSchema({ modelName }),
+  });
 
-export const webSearchTool = tool({
-  description: `Search for information across various sources.
+export const webSearchToolInputSchema = createWebSearchToolInputSchema();
+
+export const createWebSearchToolSchema = ({
+  modelName,
+}: ModelAwareToolSchemaOptions = {}) =>
+  tool({
+    description: `Search for information across various sources.
 
 <instructions>
 - MUST use this tool to access up-to-date or external information when needed; DO NOT rely solely on internal knowledge
@@ -511,18 +555,28 @@ export const webSearchTool = tool({
 - Include specific versions, configurations, and technical details; cite reliable sources (NIST, OWASP, CVE databases)
 - For commands/installations, prioritize Kali Linux compatibility using apt or pre-installed tools
 </instructions>`,
-  inputSchema: webSearchToolInputSchema,
-});
+    inputSchema: createWebSearchToolInputSchema({ modelName }),
+  });
+
+export const webSearchTool = createWebSearchToolSchema();
 
 export type WebSearchToolInput = z.infer<typeof webSearchToolInputSchema>;
 
-export const openUrlToolInputSchema = z.object({
-  url: z.string().describe("The URL to open and retrieve content from"),
-  brief: toolBriefSchema,
-});
+export const createOpenUrlToolInputSchema = ({
+  modelName,
+}: ModelAwareToolSchemaOptions = {}) =>
+  z.object({
+    url: z.string().describe("The URL to open and retrieve content from"),
+    brief: createToolBriefSchema({ modelName }),
+  });
 
-export const openUrlTool = tool({
-  description: `Retrieve the full contents of a specific webpage by URL.
+export const openUrlToolInputSchema = createOpenUrlToolInputSchema();
+
+export const createOpenUrlToolSchema = ({
+  modelName,
+}: ModelAwareToolSchemaOptions = {}) =>
+  tool({
+    description: `Retrieve the full contents of a specific webpage by URL.
 
 <instructions>
 - Use to fetch and read a specific webpage, usually obtained from a prior search
@@ -530,8 +584,10 @@ export const openUrlTool = tool({
 - Prioritize cybersecurity-relevant information: CVEs, CVSS scores, exploits, PoCs, security tools, and pentest methodologies
 - Include specific versions, configurations, and technical details; cite reliable sources (NIST, OWASP, CVE databases)
 </instructions>`,
-  inputSchema: openUrlToolInputSchema,
-});
+    inputSchema: createOpenUrlToolInputSchema({ modelName }),
+  });
+
+export const openUrlTool = createOpenUrlToolSchema();
 
 export type OpenUrlToolInput = z.infer<typeof openUrlToolInputSchema>;
 
@@ -543,6 +599,22 @@ export const NOTE_CATEGORIES = [
   "plan",
 ] as const;
 const noteCategorySchema = z.enum(NOTE_CATEGORIES);
+export const NULLISH_OPTIONAL_QUERY_FILTER_VALUES = [
+  "null",
+  "none",
+  "nil",
+  "undefined",
+] as const;
+export type NullishOptionalQueryFilterValue =
+  (typeof NULLISH_OPTIONAL_QUERY_FILTER_VALUES)[number];
+export const NULLISH_OPTIONAL_QUERY_FILTER_PATTERN =
+  /^\s*(?:null|none|nil|undefined)\s*$/i;
+const nullishOptionalQueryFilterValueSchema = z
+  .string()
+  .regex(NULLISH_OPTIONAL_QUERY_FILTER_PATTERN)
+  .transform(
+    (value) => value.trim().toLowerCase() as NullishOptionalQueryFilterValue,
+  );
 
 export const createNoteToolInputSchema = z.object({
   title: z.string().describe("A concise, descriptive title for the note"),
@@ -609,7 +681,9 @@ Use tags like "critical", "confirmed", "needs-verification" to track finding sta
 export type CreateNoteToolInput = z.infer<typeof createNoteToolInputSchema>;
 
 export const listNotesToolInputSchema = z.object({
-  category: noteCategorySchema
+  category: z
+    .union([noteCategorySchema, nullishOptionalQueryFilterValueSchema])
+    .nullable()
     .optional()
     .describe(
       'Filter notes by category. Valid values: "general", "findings", "methodology", "questions", "plan". Omit to include all categories.',
@@ -620,6 +694,7 @@ export const listNotesToolInputSchema = z.object({
     .describe("Filter notes that have any of the specified tags (OR logic)"),
   search: z
     .string()
+    .nullable()
     .optional()
     .describe("Full-text search query to filter notes by title or content"),
 });
@@ -734,25 +809,22 @@ export type AgentToolSchemaMode = "agent" | "ask";
 export const createAgentToolSchemaSet = ({
   mode = "agent",
   notesEnabled = true,
-  isTemporary = false,
   hasPerplexityApiKey = false,
   hasJinaApiKey = false,
 }: {
   mode?: AgentToolSchemaMode;
   notesEnabled?: boolean;
-  isTemporary?: boolean;
   hasPerplexityApiKey?: boolean;
   hasJinaApiKey?: boolean;
 } = {}) => {
-  const notes =
-    !isTemporary && notesEnabled
-      ? {
-          create_note: createNoteTool,
-          list_notes: listNotesTool,
-          update_note: updateNoteTool,
-          delete_note: deleteNoteTool,
-        }
-      : {};
+  const notes = notesEnabled
+    ? {
+        create_note: createNoteTool,
+        list_notes: listNotesTool,
+        update_note: updateNoteTool,
+        delete_note: deleteNoteTool,
+      }
+    : {};
   const networkTools = {
     ...(hasPerplexityApiKey ? { web_search: webSearchTool } : {}),
     ...(hasJinaApiKey ? { open_url: openUrlTool } : {}),

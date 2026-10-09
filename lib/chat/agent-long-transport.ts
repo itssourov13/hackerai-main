@@ -41,6 +41,23 @@ type RunHandle = {
   approvalSessionPublicAccessToken?: string;
 };
 
+export type AgentLongRunStarted = {
+  chatId?: string;
+  runId: string;
+  runCorrelationToken?: string;
+};
+
+type AgentStartResult = { response: Response; handle?: RunHandle };
+// Allow the route's 30-second budget plus response delivery time.
+const AGENT_START_TIMEOUT_MS = 45_000;
+const pendingAgentStarts = new Map<string, Promise<AgentStartResult>>();
+
+/** Capture the in-flight start before Stop detaches the local stream. */
+export const getPendingAgentLongRunStart = (
+  chatId: string,
+): Promise<AgentLongRunStarted | undefined> | undefined =>
+  pendingAgentStarts.get(chatId)?.then(({ handle }) => handle);
+
 const getAgentResumeUrl = (chatId: string | undefined): string | undefined =>
   chatId
     ? `${AGENT_RESUME_ENDPOINT}?chatId=${encodeURIComponent(chatId)}`
@@ -164,8 +181,11 @@ const STREAM_TIMEOUT_MS = 5 * 60 * 1000;
 const STREAM_IDLE_TIMEOUT_SECONDS = STREAM_TIMEOUT_MS / 1000;
 const POST_FINISH_DRAIN_TIMEOUT_MS = 2_000;
 const COMPLETED_RUN_DRAIN_TIMEOUT_MS = 5_000;
-const QUIET_STREAM_STATUS_POLL_INTERVAL_MS = 2_000;
-const QUIET_STREAM_STATUS_POLL_AFTER_MS = 5_000;
+// The task emits a hidden heartbeat every 25 seconds. Poll at most once during
+// that quiet window so fallback status checks cannot exhaust Trigger's shared
+// API token bucket when many Agent runs are active at the same time.
+const QUIET_STREAM_STATUS_POLL_INTERVAL_MS = 10_000;
+const QUIET_STREAM_STATUS_POLL_AFTER_MS = 15_000;
 
 const getChatIdFromRequestInit = (
   init: RequestInit | undefined,
@@ -209,6 +229,7 @@ const buildSSEResponseFromRun = (
     chatId?: string;
     statusEndpoint?: string;
     resumeUrl?: string;
+    onRunClosed?: (runId: string) => void;
   },
 ): Response => {
   const { runId, publicAccessToken } = handle;
@@ -298,6 +319,7 @@ const buildSSEResponseFromRun = (
       const sendAbortAndClose = () => {
         if (closed) return;
         closed = true;
+        options?.onRunClosed?.(runId);
         if (!isControllerErrored()) {
           try {
             controller.enqueue(
@@ -318,6 +340,7 @@ const buildSSEResponseFromRun = (
       const close = () => {
         if (closed) return;
         closed = true;
+        options?.onRunClosed?.(runId);
         if (!isControllerErrored()) {
           try {
             controller.close();
@@ -410,7 +433,7 @@ const buildSSEResponseFromRun = (
         };
 
         const handleRunStatus = (status: string | undefined) => {
-          if (status === "COMPLETED") {
+          if (status === "COMPLETED" || status === "DETACHED") {
             startCompletedRunDrainTimer();
             return;
           }
@@ -740,27 +763,63 @@ const buildSSEResponseFromRun = (
 
 export const fetchAgentLongStream = async (
   init: RequestInit | undefined,
+  onRunStarted?: (run: AgentLongRunStarted) => void,
+  onRunClosed?: (runId: string) => void,
 ): Promise<Response> => {
+  init?.signal?.throwIfAborted();
   const chatId = getChatIdFromRequestInit(init);
   const linkedAbort = createLinkedAbortController(init?.signal ?? undefined);
   const unregisterStartCancel = registerAgentLongRealtimeCancel(chatId, () => {
     linkedAbort.controller.abort();
   });
 
-  try {
-    const startResponse = await fetchWithErrorHandlers(AGENT_API_ENDPOINT, {
+  // Aborting this POST only drops the browser's response; it cannot undo the
+  // durable task created by the route. Retain its handle so an explicit Stop
+  // can wait for association and cancel that exact run. Navigation still only
+  // detaches the local stream and leaves durable work available to reconnect.
+  const startAbort = new AbortController();
+  let startTimeout: ReturnType<typeof setTimeout> | undefined;
+  const startDeadline = new Promise<never>((_, reject) => {
+    startTimeout = setTimeout(() => {
+      const error = new Error(
+        "Agent startup timed out. Reload this chat to reconnect and stop any active run.",
+      );
+      reject(error);
+      startAbort.abort(error);
+    }, AGENT_START_TIMEOUT_MS);
+  });
+  const request = (async (): Promise<AgentStartResult> => {
+    const response = await fetchWithErrorHandlers(AGENT_API_ENDPOINT, {
       ...init,
-      signal: linkedAbort.controller.signal,
+      signal: startAbort.signal,
     });
-    if (!startResponse.ok) return startResponse;
+    return response.ok
+      ? { response, handle: (await response.json()) as RunHandle }
+      : { response };
+  })();
+  const start = Promise.race([request, startDeadline]);
+  if (chatId) pendingAgentStarts.set(chatId, start);
 
-    const handle: RunHandle = await startResponse.json();
+  try {
+    const { response, handle } = await start;
+    linkedAbort.controller.signal.throwIfAborted();
+    if (!handle) return response;
+    onRunStarted?.({
+      chatId: handle.chatId ?? chatId,
+      runId: handle.runId,
+      runCorrelationToken: handle.runCorrelationToken,
+    });
     return buildSSEResponseFromRun(handle, init?.signal ?? undefined, {
       chatId,
       resumeUrl: getAgentResumeUrl(chatId),
       statusEndpoint: AGENT_STATUS_ENDPOINT,
+      onRunClosed,
     });
   } finally {
+    clearTimeout(startTimeout);
+    if (chatId && pendingAgentStarts.get(chatId) === start) {
+      pendingAgentStarts.delete(chatId);
+    }
     unregisterStartCancel?.();
     linkedAbort.cleanup();
   }
@@ -769,6 +828,7 @@ export const fetchAgentLongStream = async (
 export const resumeAgentLongStream = async (
   url: string,
   init: RequestInit | undefined,
+  onRunClosed?: (runId: string) => void,
 ): Promise<Response> => {
   const chatId = getChatIdFromResumeUrl(url);
   const linkedAbort = createLinkedAbortController(init?.signal ?? undefined);
@@ -793,6 +853,7 @@ export const resumeAgentLongStream = async (
       chatId,
       resumeUrl: url,
       statusEndpoint: getStatusEndpointFromResumeUrl(url),
+      onRunClosed,
     });
   } finally {
     unregisterStartCancel?.();

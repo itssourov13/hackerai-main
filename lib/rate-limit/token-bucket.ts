@@ -1,4 +1,13 @@
-import { Ratelimit } from "@upstash/ratelimit";
+import {
+  ABLITERATION_MODEL_ID,
+  ABLITERATION_MODEL_KEY,
+  ABLITERATION_BASE_PRICING,
+  ABLITERATION_LARGE_V2_MODEL_ID,
+  ABLITERATION_LARGE_V2_MODEL_KEY,
+  ABLITERATION_LARGE_V2_PRICING,
+} from "@/lib/ai/abliteration";
+import { randomUUID } from "node:crypto";
+import { limitPaidBucket } from "./paid-bucket";
 import { ChatSDKError } from "@/lib/errors";
 import type {
   SubscriptionTier,
@@ -19,55 +28,217 @@ import {
   type LimitCapReason,
 } from "@/lib/limit-pressure";
 import { isUserRateLimitKey } from "./key-cleanup";
+import {
+  NORMAL_USAGE_MULTIPLIER,
+  POINTS_PER_DOLLAR,
+  includedPointsToExtraUsagePoints,
+  extraUsagePointsToIncludedPoints,
+} from "./usage-pricing";
 
 export { isUserRateLimitKey } from "./key-cleanup";
+export {
+  NORMAL_USAGE_MULTIPLIER,
+  POINTS_PER_DOLLAR,
+  EXTRA_USAGE_REQUEST_MULTIPLIER,
+  includedPointsToExtraUsagePoints,
+  extraUsagePointsToIncludedPoints,
+} from "./usage-pricing";
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-/** Model pricing: $/1M tokens per model. */
-const MODEL_PRICING_MAP: Record<string, { input: number; output: number }> = {
-  default: { input: 0.5, output: 3.0 },
-  "model-sonnet-4.6": { input: 3.0, output: 15.0 },
-  // Grok 4.5 rates from OpenRouter: $2.00 in / $6.00 out per 1M tokens.
-  "model-grok-4.5": { input: 2.0, output: 6.0 },
-  "model-grok-4.5-pro": { input: 2.0, output: 6.0 },
-  "model-gemini-3-flash": { input: 2.0, output: 6.0 },
-  // Auto and compatibility aliases now resolve to Grok 4.5.
-  "ask-model": { input: 2.0, output: 6.0 },
-  "agent-model": { input: 2.0, output: 6.0 },
-  "model-minimax-m3": { input: 2.0, output: 6.0 },
-  "fallback-agent-model": { input: 2.0, output: 6.0 },
-  "fallback-ask-model": { input: 2.0, output: 6.0 },
-  // Rates from OpenRouter: $0.09 in / $0.18 out per 1M tokens.
-  "agent-model-free": { input: 0.09, output: 0.18 },
-  "model-deepseek-v4-pro": { input: 0.435, output: 0.87 },
-  "fallback-grok-4.5": { input: 2.0, output: 6.0 },
-  "model-opus-4.6": { input: 5.0, output: 25.0 },
-  // Rates from OpenRouter: $0.9086 in / $2.856 out per 1M tokens.
-  "model-glm-5.2": { input: 0.9086, output: 2.856 },
-  // Kimi keys are retained as compatibility aliases for stale persisted routes.
-  // Rates from OpenRouter: $0.95 in / $4.00 out per 1M tokens.
-  "model-kimi-k2.7-code": { input: 0.95, output: 4.0 },
-  "model-kimi-k2.6": { input: 0.95, output: 4.0 },
+type ModelPricing = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
 };
 
-const getModelPricing = (modelName?: string) =>
-  (modelName && MODEL_PRICING_MAP[modelName]) || MODEL_PRICING_MAP.default;
+const DEFAULT_PRICING: ModelPricing = {
+  input: 0.5,
+  output: 3.0,
+  cacheRead: 0.5,
+  cacheWrite: 0.5,
+};
+const GROK_4_6_BASE_PRICING: ModelPricing = {
+  input: 2.0,
+  output: 6.0,
+  cacheRead: 0.5,
+  cacheWrite: 2.0,
+};
+const GROK_4_6_LONG_CONTEXT_PRICING: ModelPricing = {
+  input: 4.0,
+  output: 12.0,
+  cacheRead: 1.0,
+  cacheWrite: 4.0,
+};
+const GROK_4_6_LONG_CONTEXT_PROMPT_TOKENS = 200_000;
+const DEEPSEEK_V4_FLASH_PRICING: ModelPricing = {
+  input: 0.09,
+  output: 0.18,
+  cacheRead: 0.018,
+  cacheWrite: 0.09,
+};
+const DEEPSEEK_V4_FLASH_0731_PRICING: ModelPricing = {
+  input: 0.14,
+  output: 0.28,
+  cacheRead: 0.0028,
+  cacheWrite: 0.14,
+};
+const DEEPSEEK_V4_PRO_PRICING: ModelPricing = {
+  input: 0.435,
+  output: 0.87,
+  cacheRead: 0.003625,
+  cacheWrite: 0.435,
+};
+const OPUS_4_6_PRICING: ModelPricing = {
+  input: 5.0,
+  output: 25.0,
+  cacheRead: 0.5,
+  cacheWrite: 6.25,
+};
+const GLM_5_2_PRICING: ModelPricing = {
+  input: 0.76,
+  output: 2.42,
+  cacheRead: 0.14,
+  cacheWrite: 0.76,
+};
+const GLM_5_3_PRICING: ModelPricing = {
+  input: 1.4,
+  output: 4.4,
+  cacheRead: 0.26,
+  cacheWrite: 1.4,
+};
+// Use the undiscounted OpenRouter ceiling so budget checks remain conservative
+// when the launch promotion or selected upstream provider changes.
+const GLM_5_3_FLASH_PRICING: ModelPricing = {
+  input: 0.15,
+  output: 0.5,
+  cacheRead: 0.03,
+  cacheWrite: 0.15,
+};
+const DEEPSEEK_V4_FLASH_VISION_PRICING: ModelPricing = {
+  input: 0.44,
+  output: 1.32,
+  cacheRead: 0.014,
+  cacheWrite: 0.44,
+};
+// Use the weekday peak ceiling from OpenRouter, including cached input.
+const DEEPSEEK_V4_1_FLASH_PRICING: ModelPricing = {
+  input: 0.3,
+  output: 1.2,
+  cacheRead: 0.006,
+  cacheWrite: 0.3,
+};
+const KIMI_K3_PRICING: ModelPricing = {
+  input: 3.0,
+  output: 15.0,
+  cacheRead: 0.3,
+  cacheWrite: 3.0,
+};
 
-/** Points per dollar (1 point = $0.0001) */
-export const POINTS_PER_DOLLAR = 10_000;
+/** Model pricing: $/1M tokens per model, including provider cache rates. */
+const MODEL_PRICING_MAP: Record<string, ModelPricing> = {
+  default: DEFAULT_PRICING,
+  [ABLITERATION_MODEL_KEY]: ABLITERATION_BASE_PRICING,
+  [ABLITERATION_MODEL_ID]: ABLITERATION_BASE_PRICING,
+  [ABLITERATION_LARGE_V2_MODEL_KEY]: ABLITERATION_LARGE_V2_PRICING,
+  [ABLITERATION_LARGE_V2_MODEL_ID]: ABLITERATION_LARGE_V2_PRICING,
+  // Grok 4.6 shares the $2/$6 base rate, with a 2x tier from 200k prompt
+  // tokens handled by getModelPricing when the input size is available.
+  "model-grok-4.6": GROK_4_6_BASE_PRICING,
+  "model-grok-4.6-pro": GROK_4_6_BASE_PRICING,
+  "model-grok-4.5": GROK_4_6_BASE_PRICING,
+  "model-grok-4.5-pro": GROK_4_6_BASE_PRICING,
+  "ask-model": GROK_4_6_BASE_PRICING,
+  "agent-model": GROK_4_6_BASE_PRICING,
+  "fallback-agent-model": GROK_4_6_BASE_PRICING,
+  "fallback-ask-model": GROK_4_6_BASE_PRICING,
+  // Ask allowance rescue and free Agent use V4.1. Historical provider
+  // response slugs below retain their original prices.
+  "ask-model-free": DEEPSEEK_V4_1_FLASH_PRICING,
+  "ask-model-free-glm": GLM_5_3_FLASH_PRICING,
+  "ask-model-free-deepseek-v41": DEEPSEEK_V4_1_FLASH_PRICING,
+  "agent-model-free": DEEPSEEK_V4_1_FLASH_PRICING,
+  // Persisted registry alias now executes V4.1, including without response metadata.
+  "model-deepseek-v4-flash-0731": DEEPSEEK_V4_1_FLASH_PRICING,
+  "model-deepseek-v4-pro": DEEPSEEK_V4_PRO_PRICING,
+  "model-deepseek-v4-pro-0813": DEEPSEEK_V4_PRO_PRICING,
+  "model-deepseek-v4-flash-vision": DEEPSEEK_V4_1_FLASH_PRICING,
+  "model-deepseek-v4-flash-vision-pro": DEEPSEEK_V4_1_FLASH_PRICING,
+  // Persisted Max compatibility key; the active provider route is Kimi K3.
+  "model-opus-4.6": KIMI_K3_PRICING,
+  // Baseline OpenRouter rates: $0.76 in / $2.42 out per 1M tokens.
+  "model-glm-5.2": GLM_5_2_PRICING,
+  // OpenRouter rates: $1.40 in / $4.40 out / $0.26 cached input per 1M tokens.
+  "model-glm-5.3": GLM_5_3_PRICING,
+  "model-glm-5.3-flash": GLM_5_3_FLASH_PRICING,
+  "model-glm-5.3-flash-pro": GLM_5_3_FLASH_PRICING,
+  "model-glm-5.3-flash-agent": GLM_5_3_FLASH_PRICING,
+  // OpenRouter rates: $3.00 in / $15.00 out / $0.30 cached input per 1M tokens.
+  "model-kimi-k3": KIMI_K3_PRICING,
+  // Provider response ids can reach accounting before local-key normalization.
+  // Historical Grok 4.5 responses retain their original flat pricing.
+  "x-ai/grok-4.5": GROK_4_6_BASE_PRICING,
+  "x-ai/grok-4.5-20260708": GROK_4_6_BASE_PRICING,
+  "x-ai/grok-4.6": GROK_4_6_BASE_PRICING,
+  "deepseek/deepseek-v4-flash": DEEPSEEK_V4_FLASH_PRICING,
+  "deepseek/deepseek-v4-flash-20260423": DEEPSEEK_V4_FLASH_PRICING,
+  "deepseek/deepseek-v4-flash-0731": DEEPSEEK_V4_FLASH_0731_PRICING,
+  "deepseek/deepseek-v4-flash-20260731": DEEPSEEK_V4_FLASH_0731_PRICING,
+  "deepseek/deepseek-v4-pro": DEEPSEEK_V4_PRO_PRICING,
+  "deepseek/deepseek-v4-pro-0813": DEEPSEEK_V4_PRO_PRICING,
+  "deepseek/deepseek-v4.1-flash": DEEPSEEK_V4_1_FLASH_PRICING,
+  "deepseek/deepseek-v4.1-flash-20260910": DEEPSEEK_V4_1_FLASH_PRICING,
+  "deepseek/deepseek-v4-flash-vision-exp": DEEPSEEK_V4_FLASH_VISION_PRICING,
+  "anthropic/claude-opus-4.6": OPUS_4_6_PRICING,
+  "z-ai/glm-5.2": GLM_5_2_PRICING,
+  "z-ai/glm-5.2-20260616": GLM_5_2_PRICING,
+  "z-ai/glm-5.3": GLM_5_3_PRICING,
+  "z-ai/glm-5.3-20260816": GLM_5_3_PRICING,
+  "z-ai/glm-5.3-flash": GLM_5_3_FLASH_PRICING,
+  "moonshotai/kimi-k3": KIMI_K3_PRICING,
+  "moonshotai/kimi-k3-20260715": KIMI_K3_PRICING,
+};
 
-/**
- * Normal usage pricing multiplier — covers additional operational costs
- * (infrastructure, overhead, etc.) on top of raw model pricing.
- * This is baked into the point cost so it depletes the subscription bucket
- * faster; it is NOT subtracted from the user's subscription credit balance.
- */
-export const NORMAL_USAGE_MULTIPLIER = 1.4;
+const GROK_4_6_MODEL_IDS = new Set([
+  "model-grok-4.6",
+  "model-grok-4.6-pro",
+  "ask-model",
+  "agent-model",
+  "fallback-agent-model",
+  "fallback-ask-model",
+  "x-ai/grok-4.6",
+]);
 
-/** Convert raw provider/tool spend into billable user-balance points. */
+const getModelPricing = (
+  modelName?: string,
+  inputTokens?: number,
+): ModelPricing => {
+  if (!modelName) return DEFAULT_PRICING;
+
+  if (
+    GROK_4_6_MODEL_IDS.has(modelName) &&
+    normalizeTokenCount(inputTokens ?? 0) >= GROK_4_6_LONG_CONTEXT_PROMPT_TOKENS
+  ) {
+    return GROK_4_6_LONG_CONTEXT_PRICING;
+  }
+
+  const exactPricing = MODEL_PRICING_MAP[modelName];
+  if (exactPricing) return exactPricing;
+
+  if (/^anthropic\/claude-4\.6-opus-\d{8}$/.test(modelName)) {
+    return OPUS_4_6_PRICING;
+  }
+
+  return DEFAULT_PRICING;
+};
+
+const normalizeTokenCount = (value: number): number =>
+  Number.isFinite(value) ? Math.max(0, value) : 0;
+
+/** Convert raw provider/tool spend into paid-plan included-usage points. */
 export const billableCostDollarsToPoints = (costDollars: number): number =>
   Number.isFinite(costDollars) && costDollars > 0
     ? Math.max(
@@ -107,8 +278,11 @@ export type UsageDeductionFailureReason =
   | "deduction_failed";
 
 export interface UsageDeductionResult {
+  /** Points deducted from the paid plan's included-usage bucket. */
   includedPointsDeducted: number;
+  /** Stored points deducted from the prepaid Extra Usage balance. */
   extraUsagePointsDeducted: number;
+  /** Uncovered cost expressed in included-usage pricing points. */
   uncoveredPoints: number;
   usageDeductionFailed: boolean;
   usageDeductionFailureReason?: UsageDeductionFailureReason;
@@ -128,6 +302,8 @@ export type DelinquencyCreditHoldResult = {
 
 export type PaidCreditResetResult = {
   outcome: "applied" | "already_applied" | "stale";
+  recoveredFromPaymentFailure: boolean;
+  paymentFailureAtMs?: number;
 };
 
 const emptyUsageDeductionResult = (): UsageDeductionResult => ({
@@ -163,8 +339,13 @@ type MonthlyLimiter = {
   limiter: {
     limit: (
       key: string,
-      options?: { rate?: number },
-    ) => Promise<{ remaining: number; reset: number; success?: boolean }>;
+      options?: { rate?: number; allowPartial?: boolean },
+    ) => Promise<{
+      remaining: number;
+      reset: number;
+      success?: boolean;
+      deducted?: number;
+    }>;
   };
   key: string;
 };
@@ -196,10 +377,12 @@ const deductAdditionalUsagePoints = async ({
   ): UsageDeductionResult => {
     const coveredPoints =
       nonNegativePoints(includedPointsDeducted) +
-      nonNegativePoints(extraUsagePointsDeducted);
+      extraUsagePointsToIncludedPoints(
+        nonNegativePoints(extraUsagePointsDeducted),
+      );
     const uncoveredPoints = Math.max(
       0,
-      normalizedAdditionalCost - coveredPoints,
+      Math.ceil(normalizedAdditionalCost - coveredPoints),
     );
     return {
       includedPointsDeducted: nonNegativePoints(includedPointsDeducted),
@@ -210,25 +393,34 @@ const deductAdditionalUsagePoints = async ({
     };
   };
 
-  const peekResult = await monthly.limiter.limit(monthly.key, { rate: 0 });
-  const available = Math.max(0, peekResult.remaining);
+  const available = extraUsageConfig?.chargeAllUsage
+    ? 0
+    : Math.max(
+        0,
+        (await monthly.limiter.limit(monthly.key, { rate: 0 })).remaining,
+      );
   const fromBucket = Math.min(normalizedAdditionalCost, available);
   let includedDeducted = 0;
 
   if (fromBucket > 0) {
     const bucketResult = await monthly.limiter.limit(monthly.key, {
       rate: fromBucket,
+      allowPartial: true,
     });
-    if (bucketResult.success !== false) {
-      includedDeducted = fromBucket;
-    }
+    // A concurrent request may have spent part of the peeked balance. Consume
+    // what remains atomically before charging the uncovered cost to Extra Usage.
+    includedDeducted =
+      bucketResult.deducted ??
+      (bucketResult.success !== false ? fromBucket : 0);
   }
 
   const fromExtraUsage = normalizedAdditionalCost - includedDeducted;
+  const extraUsagePointsToDeduct =
+    includedPointsToExtraUsagePoints(fromExtraUsage);
   let extraUsageDeducted = 0;
   let failureReason: UsageDeductionFailureReason | undefined;
 
-  if (fromExtraUsage > 0) {
+  if (extraUsagePointsToDeduct > 0) {
     if (
       extraUsageConfig?.enabled &&
       (extraUsageConfig.hasBalance || extraUsageConfig.autoReloadEnabled)
@@ -240,12 +432,12 @@ const deductAdditionalUsagePoints = async ({
             ? await deductFromTeamBalance(
                 organizationId!,
                 userId,
-                fromExtraUsage,
+                extraUsagePointsToDeduct,
                 usageSettlementId,
               )
             : await deductFromBalance(
                 userId,
-                fromExtraUsage,
+                extraUsagePointsToDeduct,
                 usageSettlementId,
               );
         } catch (error) {
@@ -259,7 +451,7 @@ const deductAdditionalUsagePoints = async ({
         }
       })();
       if (deductResult.success) {
-        extraUsageDeducted = fromExtraUsage;
+        extraUsageDeducted = extraUsagePointsToDeduct;
       } else {
         failureReason = getDeductionFailureReason(deductResult);
       }
@@ -313,13 +505,17 @@ export const calculateTokenCost = (
   tokens: number,
   type: "input" | "output",
   modelName?: string,
+  promptTokens?: number,
 ): number => {
   if (tokens <= 0) return 0;
-  const pricing = getModelPricing(modelName);
-  const price = type === "input" ? pricing.input : pricing.output;
-  return Math.ceil(
-    (tokens / 1_000_000) * price * POINTS_PER_DOLLAR * NORMAL_USAGE_MULTIPLIER,
+  const pricing = getModelPricing(
+    modelName,
+    type === "input" ? tokens : promptTokens,
   );
+  const price = type === "input" ? pricing.input : pricing.output;
+  const costPoints =
+    (tokens / 1_000_000) * price * POINTS_PER_DOLLAR * NORMAL_USAGE_MULTIPLIER;
+  return Math.ceil(Number(costPoints.toFixed(6)));
 };
 
 /**
@@ -333,19 +529,65 @@ export const calculateRawTokenCost = (
   modelName?: string,
 ): number => {
   if (tokens <= 0) return 0;
-  const pricing = getModelPricing(modelName);
+  const pricing = getModelPricing(
+    modelName,
+    type === "input" ? tokens : undefined,
+  );
   const price = type === "input" ? pricing.input : pricing.output;
   return Math.ceil((tokens / 1_000_000) * price * POINTS_PER_DOLLAR);
+};
+
+/**
+ * Estimate raw model spend without applying HackerAI's billing multiplier.
+ *
+ * Provider usage reports cache reads/writes as subsets of input tokens. Price
+ * each subset at its model-specific rate and leave unknown models at the
+ * conservative full-input default.
+ */
+export const calculateRawModelUsageCostDollars = ({
+  inputTokens,
+  outputTokens,
+  cacheReadTokens = 0,
+  cacheWriteTokens = 0,
+  modelName,
+}: {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  modelName?: string;
+}): number => {
+  const normalizedInput = normalizeTokenCount(inputTokens);
+  const normalizedOutput = normalizeTokenCount(outputTokens);
+  const normalizedCacheRead = Math.min(
+    normalizedInput,
+    normalizeTokenCount(cacheReadTokens),
+  );
+  const normalizedCacheWrite = Math.min(
+    normalizedInput - normalizedCacheRead,
+    normalizeTokenCount(cacheWriteTokens),
+  );
+  const uncachedInput =
+    normalizedInput - normalizedCacheRead - normalizedCacheWrite;
+  const pricing = getModelPricing(modelName, normalizedInput);
+
+  return (
+    (uncachedInput * pricing.input +
+      normalizedCacheRead * pricing.cacheRead +
+      normalizedCacheWrite * pricing.cacheWrite +
+      normalizedOutput * pricing.output) /
+    1_000_000
+  );
 };
 
 // =============================================================================
 // Budget Limits
 // =============================================================================
 
-/** Monthly credit amounts per tier (1:1 with subscription price) */
+/** Monthly credit amounts per tier. */
 const MONTHLY_CREDITS: Record<string, number> = {
   free: 0,
-  pro: 250_000, // $25
+  pro: 250_000,
   "pro-plus": 600_000, // $60
   ultra: 2_000_000, // $200
   team: 400_000, // $40
@@ -433,8 +675,10 @@ if targetRefilledAt >= 0 then
     "tokens", targetRemaining,
     "cycleAllocation", targetAllocation,
     "cycleTierMax", tierMax,
-    "refilledAt", targetRefilledAt
+    "refilledAt", targetRefilledAt,
+    "billingPeriodEndMs", targetRefilledAt + 30 * 24 * 60 * 60 * 1000
   )
+  redis.call("PERSIST", key)
 else
   redis.call(
     "HSET",
@@ -473,6 +717,7 @@ local currentAllocation = tonumber(redis.call("HGET", bucketKey, "cycleAllocatio
 if existingTransitionType == "payment_failed"
   and existingSubscriptionId == subscriptionId
   and existingInvoiceId == invoiceId then
+  redis.call("PERSIST", bucketKey)
   return {2, currentTokens, currentAllocation}
 end
 
@@ -502,7 +747,7 @@ redis.call(
   "billingSubscriptionId", subscriptionId,
   "billingInvoiceId", invoiceId
 )
-redis.call("EXPIRE", bucketKey, expireSeconds)
+redis.call("PERSIST", bucketKey)
 return {1, remaining, allocation}
 `;
 
@@ -517,6 +762,7 @@ local expireSeconds = tonumber(ARGV[6])
 local transitionAtMs = tonumber(ARGV[7])
 local subscriptionId = ARGV[8]
 local invoiceId = ARGV[9]
+local periodEndMs = tonumber(ARGV[10])
 
 local existingTransitionType = redis.call("HGET", bucketKey, "billingTransitionType")
 local existingTransitionAtMs = tonumber(redis.call("HGET", bucketKey, "billingTransitionAtMs"))
@@ -526,17 +772,25 @@ local existingInvoiceId = redis.call("HGET", bucketKey, "billingInvoiceId")
 if existingTransitionType == "paid"
   and existingSubscriptionId == subscriptionId
   and existingInvoiceId == invoiceId then
-  return 2
+  if periodEndMs > 0 then
+    redis.call("HSET", bucketKey, "billingPeriodEndMs", periodEndMs)
+    redis.call("PERSIST", bucketKey)
+  end
+  return {2, 0, 0}
 end
 
 if existingTransitionAtMs and existingTransitionAtMs > transitionAtMs then
-  return 0
+  return {0, 0, 0}
 end
 if existingTransitionAtMs
   and existingTransitionAtMs == transitionAtMs
   and existingTransitionType ~= "payment_failed" then
-  return 0
+  return {0, 0, 0}
 end
+
+local recoveredFromPaymentFailure = existingTransitionType == "payment_failed"
+  and existingSubscriptionId == subscriptionId
+  and existingInvoiceId == invoiceId
 
 redis.call("DEL", bucketKey)
 redis.call(
@@ -552,8 +806,17 @@ redis.call(
   "billingSubscriptionId", subscriptionId,
   "billingInvoiceId", invoiceId
 )
-redis.call("EXPIRE", bucketKey, expireSeconds)
-return 1
+if periodEndMs > 0 then
+  redis.call("HSET", bucketKey, "billingPeriodEndMs", periodEndMs)
+  redis.call("PERSIST", bucketKey)
+else
+  redis.call("EXPIRE", bucketKey, expireSeconds)
+end
+return {
+  1,
+  recoveredFromPaymentFailure and 1 or 0,
+  recoveredFromPaymentFailure and existingTransitionAtMs or 0
+}
 `;
 
 const enforceStoredCycleAllocation = async (
@@ -610,11 +873,20 @@ const createRateLimiter = (
   return {
     monthlyLimit,
     monthly: {
-      limiter: new Ratelimit({
-        redis: redis!,
-        limiter: Ratelimit.tokenBucket(monthlyLimit, "30 d", monthlyLimit),
-        prefix: "usage:monthly",
-      }),
+      limiter: {
+        limit: (
+          key: string,
+          options?: { rate?: number; allowPartial?: boolean },
+        ) =>
+          limitPaidBucket(
+            redis!,
+            `usage:monthly:${key}`,
+            monthlyLimit,
+            options?.rate ?? 1,
+            Date.now(),
+            options?.allowPartial ?? false,
+          ),
+      },
       key: `${userId}:${subscription}`,
     },
   };
@@ -754,19 +1026,16 @@ export const checkTokenBucketLimit = async (
       }),
     });
 
+    // Initialize a new seat and transfer its debt in one transaction before
+    // another request can observe and spend an undebited allowance.
+    if (isNewTeamBucket) {
+      await applyTeamSeatDebt(userId, organizationId!);
+    }
+
     // Step 1: Check limit WITHOUT deducting (rate: 0 peeks at current state)
     let monthlyCheck = await monthly.limiter.limit(monthly.key, { rate: 0 });
 
-    // Step 1.5: For new team members, apply seat debt from removed members
-    if (isNewTeamBucket) {
-      await applyTeamSeatDebt(userId, organizationId!);
-      // Re-peek after debt burn to get accurate remaining
-      monthlyCheck = await monthly.limiter.limit(monthly.key, { rate: 0 });
-    }
-
-    // Price-specific and prorated cycles store their authoritative allowance
-    // in the bucket. Re-apply the cap if Upstash's 30-day refill races ahead
-    // of the Stripe renewal webhook.
+    // Price-specific and prorated cycles store their authoritative allowance.
     const monthlyStorageKey = getMonthlyBucketKey(userId, subscription);
     const enforcedCycleAllocation = await enforceStoredCycleAllocation(
       redis,
@@ -781,11 +1050,15 @@ export const checkTokenBucketLimit = async (
       };
     }
 
-    // Step 2: Check if we have enough capacity, or if we need extra usage
-    const shortfall = Math.max(0, estimatedCost - monthlyCheck.remaining);
+    // Step 2: Check if we have enough capacity, or if we need extra usage.
+    // Models excluded from the plan allowance charge the full request to Extra Usage.
+    const shortfall = extraUsageConfig?.chargeAllUsage
+      ? estimatedCost
+      : Math.max(0, estimatedCost - monthlyCheck.remaining);
+    const extraUsageShortfall = includedPointsToExtraUsagePoints(shortfall);
 
     // If we're over limit, try extra usage (prepaid balance)
-    if (shortfall > 0) {
+    if (extraUsageShortfall > 0) {
       if (
         extraUsageConfig?.enabled &&
         (extraUsageConfig.hasBalance || extraUsageConfig.autoReloadEnabled)
@@ -794,12 +1067,24 @@ export const checkTokenBucketLimit = async (
         // everyone else hits their personal balance.
         const isTeamPool = subscription === "team" && !!organizationId;
         const deductResult = isTeamPool
-          ? await deductFromTeamBalance(organizationId!, userId, shortfall)
-          : await deductFromBalance(userId, shortfall);
+          ? await deductFromTeamBalance(
+              organizationId!,
+              userId,
+              extraUsageShortfall,
+            )
+          : await deductFromBalance(userId, extraUsageShortfall);
 
         if (deductResult.success) {
           // Extra usage covered the shortfall. Deduct only what subscription contributed.
           const bucketDeduct = estimatedCost - shortfall;
+
+          // An exhausted bucket reports success: false even for the zero-rate
+          // peek above. When Extra Usage covers the whole request there is no
+          // subscription debit to validate, so that failed peek must not block
+          // an otherwise successful paid request.
+          if (bucketDeduct <= 0) {
+            return buildResult(monthlyCheck, 0, extraUsageShortfall);
+          }
 
           const monthlyResult = await monthly.limiter.limit(monthly.key, {
             rate: bucketDeduct,
@@ -808,9 +1093,13 @@ export const checkTokenBucketLimit = async (
           if (!monthlyResult.success) {
             try {
               if (isTeamPool) {
-                await refundToTeamBalance(organizationId!, userId, shortfall);
+                await refundToTeamBalance(
+                  organizationId!,
+                  userId,
+                  extraUsageShortfall,
+                );
               } else {
-                await refundToBalance(userId, shortfall);
+                await refundToBalance(userId, extraUsageShortfall);
               }
             } catch (refundError) {
               console.error(
@@ -821,7 +1110,7 @@ export const checkTokenBucketLimit = async (
             throw monthlyLimitError(monthlyResult.reset);
           }
 
-          return buildResult(monthlyResult, bucketDeduct, shortfall);
+          return buildResult(monthlyResult, bucketDeduct, extraUsageShortfall);
         }
 
         // Deduction failed - check why
@@ -993,11 +1282,10 @@ export const deductUsageDelta = async (
  * If extra usage was used for input (bucket at 0), also deducts output from extra usage.
  * If we over-estimated input cost, refunds the difference back to the bucket.
  *
- * @param providerCostDollars - If provided (from authoritative provider cost),
- *   uses this instead of token calculation. On clean completions this includes
- *   model + sandbox + tool costs.
- *   On non-clean completions this is undefined; nonModelCostDollars covers sandbox/tool costs.
- * @param nonModelCostDollars - Sandbox session and tool costs (always accurate). When providerCostDollars
+ * @param resolvedCostDollars - If provided, uses the UsageTracker's resolved
+ *   provider or hybrid total instead of recalculating aggregate tokens with one
+ *   model. This includes model + sandbox + tool costs.
+ * @param nonModelCostDollars - Sandbox session and tool costs (always accurate). When resolvedCostDollars
  *   is undefined (non-clean streams), this is added on top of token-based model cost.
  */
 export const deductUsage = async (
@@ -1007,7 +1295,7 @@ export const deductUsage = async (
   actualInputTokens: number,
   actualOutputTokens: number,
   extraUsageConfig?: ExtraUsageConfig,
-  providerCostDollars?: number,
+  resolvedCostDollars?: number,
   modelName?: string,
   nonModelCostDollars: number = 0,
   organizationId?: string,
@@ -1034,8 +1322,12 @@ export const deductUsage = async (
     failureReason?: UsageDeductionResult["usageDeductionFailureReason"],
   ): UsageDeductionResult => {
     const coveredPoints =
-      result.includedPointsDeducted + result.extraUsagePointsDeducted;
-    const uncoveredPoints = Math.max(0, actualCostPoints - coveredPoints);
+      result.includedPointsDeducted +
+      extraUsagePointsToIncludedPoints(result.extraUsagePointsDeducted);
+    const uncoveredPoints = Math.max(
+      0,
+      Math.ceil(actualCostPoints - coveredPoints),
+    );
     return {
       ...result,
       uncoveredPoints,
@@ -1087,12 +1379,15 @@ export const deductUsage = async (
     });
     lastKnownDeductionResult = buildDeductionResult();
 
-    // Calculate actual billable cost - prefer provider cost if available.
-    // Provider cost already includes non-model costs (sandbox/tools) when present.
-    // When absent (non-clean streams), add billable non-model costs on top of
-    // token-based model pricing.
-    if (providerCostDollars !== undefined && providerCostDollars > 0) {
-      actualCostPoints = billableCostDollarsToPoints(providerCostDollars);
+    // Calculate actual billable cost from the UsageTracker's resolved provider
+    // or hybrid total. Legacy callers without a resolved total retain the
+    // aggregate token fallback.
+    if (
+      resolvedCostDollars !== undefined &&
+      Number.isFinite(resolvedCostDollars) &&
+      resolvedCostDollars >= 0
+    ) {
+      actualCostPoints = billableCostDollarsToPoints(resolvedCostDollars);
     } else {
       const modelForActualCost = actualModelName ?? modelName;
       const actualInputCost = calculateTokenCost(
@@ -1104,6 +1399,7 @@ export const deductUsage = async (
         actualOutputTokens,
         "output",
         modelForActualCost,
+        actualInputTokens,
       );
       const nonModelCostPoints =
         nonModelCostDollars > 0
@@ -1114,7 +1410,8 @@ export const deductUsage = async (
 
     const initialCoveredPoints =
       initialDeduction !== undefined
-        ? initialIncludedPoints + initialExtraUsagePoints
+        ? initialIncludedPoints +
+          extraUsagePointsToIncludedPoints(initialExtraUsagePoints)
         : estimatedInputCost;
 
     // Calculate the difference between what has already been deducted and actual cost
@@ -1124,8 +1421,8 @@ export const deductUsage = async (
     if (costDifference < 0) {
       const pointsToRefund = Math.abs(costDifference);
       const extraUsageRefundTarget = Math.min(
-        pointsToRefund,
         initialExtraUsagePoints,
+        Math.floor(pointsToRefund),
       );
 
       if (extraUsageRefundTarget > 0) {
@@ -1150,12 +1447,28 @@ export const deductUsage = async (
         );
       }
 
+      const refundedExtraUsageCoverage = extraUsagePointsToIncludedPoints(
+        extraUsageRefundTarget,
+      );
       const includedRefundPoints = Math.min(
-        pointsToRefund - extraUsageRefundTarget,
+        Math.max(0, Math.floor(pointsToRefund - refundedExtraUsageCoverage)),
         initialIncludedPoints,
       );
       if (includedRefundPoints > 0) {
-        await refundBucketTokens(userId, subscription, includedRefundPoints);
+        const refunded = await refundBucketTokens(
+          userId,
+          subscription,
+          includedRefundPoints,
+          usageSettlementId
+            ? `${usageSettlementId}:settlement-refund`
+            : randomUUID(),
+        );
+        if (!refunded) {
+          return withFinalCoverage(
+            lastKnownDeductionResult,
+            "deduction_failed",
+          );
+        }
         lastKnownDeductionResult = buildDeductionResult(
           0,
           0,
@@ -1176,7 +1489,7 @@ export const deductUsage = async (
       monthly,
       userId,
       subscription,
-      additionalCostPoints: costDifference,
+      additionalCostPoints: Math.ceil(costDifference),
       extraUsageConfig,
       organizationId,
       usageSettlementId,
@@ -1197,49 +1510,57 @@ export const deductUsage = async (
 
 /**
  * Refund bucket tokens by adding capacity back to the monthly token bucket.
- * Uses direct Redis operations since Upstash Ratelimit doesn't have a native refund method.
+ * The token update and per-refund marker are written atomically so an
+ * ambiguous network response can be retried without applying credit twice.
  */
+const REFUND_BUCKET_TOKENS_SCRIPT = `
+local bucketKey = KEYS[1]
+local refundField = ARGV[1]
+local pointsToRefund = tonumber(ARGV[2])
+local defaultLimit = tonumber(ARGV[3])
+
+local currentTokens = tonumber(redis.call("HGET", bucketKey, "tokens") or "0")
+if redis.call("HEXISTS", bucketKey, refundField) == 1 then
+  return {0, currentTokens}
+end
+
+local cycleAllocation = tonumber(redis.call("HGET", bucketKey, "cycleAllocation"))
+local refundCap = cycleAllocation or defaultLimit
+local nextTokens = math.min(currentTokens + pointsToRefund, refundCap)
+redis.call("HSET", bucketKey, "tokens", nextTokens, refundField, pointsToRefund)
+return {1, nextTokens}
+`;
+
 const refundBucketTokens = async (
   userId: string,
   subscription: SubscriptionTier,
   pointsToRefund: number,
-): Promise<void> => {
-  if (pointsToRefund <= 0) return;
+  refundId: string,
+): Promise<boolean> => {
+  if (pointsToRefund <= 0) return true;
 
   const redis = createRedisClient();
-  if (!redis) return;
+  if (!redis) return false;
 
   const { monthly: monthlyLimit } = getBudgetLimits(subscription);
   const monthlyKey = getMonthlyBucketKey(userId, subscription);
 
   try {
-    const monthlyTokens = await redis.hincrby(
-      monthlyKey,
-      "tokens",
-      pointsToRefund,
+    await redis.eval(
+      REFUND_BUCKET_TOKENS_SCRIPT,
+      [monthlyKey],
+      [`usage-refund:${refundId}`, pointsToRefund, monthlyLimit],
     );
-
-    const cycleAllocation = await getStoredCycleAllocation(
-      redis,
-      monthlyKey,
-      monthlyLimit,
-    );
-    const refundCap = cycleAllocation ?? monthlyLimit;
-
-    // Cap refunds at the current cycle allocation, which may be lower than
-    // the broad subscription tier for grandfathered or prorated users.
-    if (monthlyTokens > refundCap) {
-      await redis.hset(monthlyKey, { tokens: refundCap });
-    }
+    return true;
   } catch (error) {
     console.error("Failed to refund bucket tokens:", error);
+    return false;
   }
 };
 
 /**
- * Reset rate limit bucket for a user by deleting their Redis key.
- * On next request, Upstash Ratelimit creates a fresh bucket at full capacity.
- * Called when a subscription renews or changes tier.
+ * Initialize a paid allowance. Subscription invoice handlers use the
+ * idempotent payment transition below rather than this administrative helper.
  */
 export const resetRateLimitBuckets = async (
   userId: string,
@@ -1351,9 +1672,20 @@ export const resetRateLimitBucketAfterPayment = async (
     Number.isFinite(transition.occurredAtMs) && transition.occurredAtMs > 0
       ? Math.floor(transition.occurredAtMs)
       : nowMs;
-  const outcomeCode = await redis.eval<
-    [number, number, number, number, number, number, number, string, string],
-    number
+  const [outcomeCode, recoveredCode, paymentFailureAtMsRaw] = await redis.eval<
+    [
+      number,
+      number,
+      number,
+      number,
+      number,
+      number,
+      number,
+      string,
+      string,
+      number,
+    ],
+    [number, number, number]
   >(
     APPLY_PAID_BUCKET_RESET_SCRIPT,
     [getMonthlyBucketKey(userId, subscription)],
@@ -1367,6 +1699,11 @@ export const resetRateLimitBucketAfterPayment = async (
       transitionAtMs,
       transition.subscriptionId,
       transition.invoiceId,
+      periodEndSeconds &&
+      Number.isFinite(periodEndSeconds) &&
+      periodEndSeconds > 0
+        ? periodEndSeconds * 1000
+        : 0,
     ],
   );
 
@@ -1377,6 +1714,13 @@ export const resetRateLimitBucketAfterPayment = async (
         : outcomeCode === 2
           ? "already_applied"
           : "stale",
+    recoveredFromPaymentFailure: recoveredCode === 1,
+    ...(recoveredCode === 1 &&
+      typeof paymentFailureAtMsRaw === "number" &&
+      Number.isFinite(paymentFailureAtMsRaw) &&
+      paymentFailureAtMsRaw > 0 && {
+        paymentFailureAtMs: paymentFailureAtMsRaw,
+      }),
   };
 };
 
@@ -1433,7 +1777,9 @@ export const capCurrentCycleAllocation = async (
         `Failed to initialize the current cycle for user ${userId}`,
       );
     }
-    await redis.expire(monthlyKey, getCycleExpireSeconds(periodEndSeconds));
+    if (!periodEndSeconds) {
+      await redis.expire(monthlyKey, getCycleExpireSeconds());
+    }
     return {
       created: true,
       previousAllocation: tierMax,
@@ -1467,10 +1813,12 @@ export const capCurrentCycleAllocation = async (
     [monthlyKey],
     [requestedTargetAllocation, tierMax, targetRefilledAt],
   );
-  await redis.expire(
-    monthlyKey,
-    getCycleExpireSeconds(periodEndSeconds, nowSeconds),
-  );
+  if (!periodEndSeconds) {
+    await redis.expire(
+      monthlyKey,
+      getCycleExpireSeconds(undefined, nowSeconds),
+    );
+  }
 
   return {
     created: false,
@@ -1483,40 +1831,25 @@ export const capCurrentCycleAllocation = async (
 };
 
 /**
- * Delete Redis keys associated with a user across every rate-limit namespace
- * written by this codebase. Called during account deletion so orphaned
- * buckets, stashes, sliding-window counters, and seat-debt flags are purged
- * immediately rather than waiting on the 30-day TTL. Best-effort — returns
- * the number of keys deleted, never throws.
- *
- * Namespaces (keep in sync with key builders in this file and sliding-window.ts):
- *   - usage:monthly:<userId>:*       — monthly token bucket (any tier)
- *   - upgrade:carryover:<userId>:*   — tier-change stash, claim, and completion keys
- *   - free_limit:<userId>:*          — free-tier shared ask/agent sliding window
- *   - free_referral_bonus:<userId>   — one-time free request units from referral signup
- *   - free_referral_bonus_grant:*:<userId> — referral bonus grant idempotency marker
- *   - free_agent_limit:<userId>:*    — legacy free-tier agent sliding window
- *   - free_monthly_cost:<userId>:*   — free-tier monthly provider/tool cost cap
- *   - free_run_lock:<userId>         — free-tier active-run concurrency lock
- *   - team:debt_applied:*:<userId>   — seat-debt idempotency flag (org-scoped)
- *
- * Deliberately NOT included: team:removed_usage:<orgId> (org counter, not
- * user-scoped) and any extra-usage balance records (stored in Convex, not Redis).
+ * Remove account-scoped rate-limit state after deletion. Email-scoped quotas
+ * survive until their normal expiry so deleting and recreating an account
+ * cannot reset its free usage.
+ * Best-effort: returns the number of deleted keys, never throws.
  */
 export const deleteUserRateLimitKeys = async (
   userId: string,
+  _freeQuotaSubject?: string,
 ): Promise<number> => {
   const redis = createRedisClient();
   if (!redis) return 0;
 
   try {
-    const keys = Array.from(
-      new Set(
-        (await scanRedisKeys(redis, `*${userId}*`)).filter((key) =>
-          isUserRateLimitKey(key, userId),
-        ),
-      ),
+    const userKeys = (await scanRedisKeys(redis, `*${userId}*`)).filter((key) =>
+      isUserRateLimitKey(key, userId),
     );
+    // Identity-scoped quotas outlive account deletion until their own TTLs.
+    // Recreating an account must not reset the allowance of the same email.
+    const keys = Array.from(new Set(userKeys));
     if (keys.length === 0) return 0;
     await deleteRedisKeys(redis, keys);
     return keys.length;
@@ -1685,6 +2018,7 @@ local tierMax = tonumber(ARGV[3])
 local cycleStartedAt = tonumber(ARGV[4])
 local refilledAt = tonumber(ARGV[5])
 local expireSeconds = tonumber(ARGV[6])
+local periodEndMs = tonumber(ARGV[7])
 
 redis.call("DEL", bucketKey)
 redis.call(
@@ -1696,7 +2030,12 @@ redis.call(
   "cycleStartedAt", cycleStartedAt,
   "refilledAt", refilledAt
 )
-redis.call("EXPIRE", bucketKey, expireSeconds)
+if periodEndMs > 0 then
+  redis.call("HSET", bucketKey, "billingPeriodEndMs", periodEndMs)
+  redis.call("PERSIST", bucketKey)
+else
+  redis.call("EXPIRE", bucketKey, expireSeconds)
+end
 return remaining
 `;
 
@@ -1713,6 +2052,7 @@ local cycleStartedAt = tonumber(ARGV[5])
 local refilledAt = tonumber(ARGV[6])
 local expireSeconds = tonumber(ARGV[7])
 local completedTtlSeconds = tonumber(ARGV[8])
+local periodEndMs = tonumber(ARGV[9])
 
 if redis.call("GET", claimKey) ~= expectedClaim then
   return {0, 0}
@@ -1741,7 +2081,12 @@ redis.call(
   "cycleStartedAt", cycleStartedAt,
   "refilledAt", refilledAt
 )
-redis.call("EXPIRE", bucketKey, expireSeconds)
+if periodEndMs > 0 then
+  redis.call("HSET", bucketKey, "billingPeriodEndMs", periodEndMs)
+  redis.call("PERSIST", bucketKey)
+else
+  redis.call("EXPIRE", bucketKey, expireSeconds)
+end
 redis.call("SET", completedKey, "1", "EX", completedTtlSeconds)
 redis.call("DEL", stashKey, claimKey)
 return {1, remaining}
@@ -1872,7 +2217,10 @@ const writeMonthlyBucketState = async (
     periodEndSeconds > nowSeconds
       ? (periodEndSeconds - THIRTY_DAYS_SECONDS) * 1000
       : nowMs;
-  await redis.eval<[number, number, number, number, number, number], number>(
+  await redis.eval<
+    [number, number, number, number, number, number, number],
+    number
+  >(
     SET_MONTHLY_BUCKET_STATE_SCRIPT,
     [getMonthlyBucketKey(userId, tier)],
     [
@@ -1882,6 +2230,11 @@ const writeMonthlyBucketState = async (
       nowMs,
       refilledAt,
       getCycleExpireSeconds(periodEndSeconds, nowSeconds),
+      periodEndSeconds &&
+      Number.isFinite(periodEndSeconds) &&
+      periodEndSeconds > 0
+        ? periodEndSeconds * 1000
+        : 0,
     ],
   );
 };
@@ -1928,7 +2281,7 @@ export const applyProratedTierChangeBucket = async (
       : 0;
   const storedResetAtMs = state.resetAtMs || fallbackResetAtMs;
   // Never let a delayed proration webhook overwrite a newer renewal bucket.
-  if (state.resetAtMs > 0 && state.resetAtMs <= nowMs) return null;
+  if (storedResetAtMs > 0 && storedResetAtMs <= nowMs) return null;
 
   const tierMax = MONTHLY_CREDITS[newTier] ?? 0;
   const newCycleMax = normalizeCycleAllocation(
@@ -1955,7 +2308,7 @@ export const applyProratedTierChangeBucket = async (
     ? (periodEndSeconds - THIRTY_DAYS_SECONDS) * 1000
     : nowMs;
   const [applied, appliedRemaining] = await redis.eval<
-    [string, number, number, number, number, number, number, number],
+    [string, number, number, number, number, number, number, number, number],
     [number, number]
   >(
     APPLY_TIER_CHANGE_BUCKET_SCRIPT,
@@ -1969,6 +2322,14 @@ export const applyProratedTierChangeBucket = async (
       refilledAt,
       getCycleExpireSeconds(periodEndSeconds, Math.floor(nowMs / 1000)),
       TIER_CHANGE_COMPLETED_TTL_SECONDS,
+      // Only monthly invoices supply this option. Preserve the stashed cycle's
+      // deadline; annual tier changes must retain their timer-based refill.
+      options.periodEndSeconds &&
+      Number.isFinite(options.periodEndSeconds) &&
+      options.periodEndSeconds > 0 &&
+      periodEndSeconds
+        ? periodEndSeconds * 1000
+        : 0,
     ],
   );
   if (applied !== 1) return null;
@@ -1983,15 +2344,13 @@ export const applyProratedTierChangeBucket = async (
 
 /**
  * Initialize a prorated token bucket for a mid-cycle upgrade.
- * Works by creating a full-capacity bucket then "burning" the excess.
+ * Writes the prorated allocation and remaining credits atomically.
  *
  * @param consumedCredits - Credits already consumed from the old tier this cycle.
  *   Deducted from the prorated allocation so users can't "double-dip".
  * @param periodEndSeconds - Optional Stripe `current_period_end` (unix seconds).
- *   When supplied, the bucket's internal `refilledAt` is rewritten so Upstash's
- *   reported reset (`refilledAt + 30 d`) lands on the actual invoice date
- *   instead of 30 days from now. Matters for mid-cycle upgrades, where the
- *   remaining cycle is shorter than 30 days.
+ *   When supplied, expiry of the paid allowance follows this deadline and
+ *   requires a new paid invoice instead of an automatic 30-day refill.
  */
 export const initProratedBucket = async (
   userId: string,
@@ -2108,10 +2467,34 @@ export const clearOrgRemovedUsage = async (orgId: string): Promise<void> => {
   }
 };
 
+const APPLY_TEAM_SEAT_DEBT_SCRIPT = `
+local bucketKey = KEYS[1]
+local debtKey = KEYS[2]
+local flagKey = KEYS[3]
+local tierMax = tonumber(ARGV[1])
+local now = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+if redis.call("EXISTS", flagKey) == 1 then return 0 end
+
+local allocation = tonumber(redis.call("HGET", bucketKey, "cycleAllocation")) or tierMax
+allocation = math.max(0, math.min(tierMax, allocation))
+local tokens = tonumber(redis.call("HGET", bucketKey, "tokens")) or allocation
+tokens = math.max(0, math.min(allocation, tokens))
+local debt = math.max(0, tonumber(redis.call("GET", debtKey)) or 0)
+local debit = math.min(debt, tierMax, tokens)
+if debit > 0 then
+  redis.call("HSET", bucketKey, "tokens", tokens - debit)
+  redis.call("HSETNX", bucketKey, "refilledAt", now)
+  redis.call("DECRBY", debtKey, debit)
+end
+redis.call("SET", flagKey, "1", "EX", ttl)
+return debit
+`;
+
 /**
- * Apply seat debt to a new team member's bucket on first use.
- * Burns up to one seat's worth (400k points) from their bucket, debiting the
- * org counter by the same amount. Uses a flag key to ensure idempotency.
+ * Transfer removed-member usage to a new seat atomically. The organization
+ * counter decreases only by the points actually consumed, and concurrent
+ * requests cannot observe a new full allowance before its debt is applied.
  */
 export const applyTeamSeatDebt = async (
   userId: string,
@@ -2120,52 +2503,15 @@ export const applyTeamSeatDebt = async (
   const redis = createRedisClient();
   if (!redis) return;
 
-  const flagKey = debtAppliedKey(orgId, userId);
-
-  try {
-    // Atomically claim the flag — if SET NX returns null, another request already claimed it
-    const claimed = await redis.set(flagKey, 1, {
-      ex: THIRTY_DAYS_SECONDS,
-      nx: true,
-    });
-    if (!claimed) return;
-
-    // Atomically claim up to one seat's worth of debt.
-    // decrby is atomic, so concurrent new members can't claim the same debt.
-    const key = orgRemovedUsageKey(orgId);
-    const afterDecr = await redis.decrby(key, TEAM_CREDITS);
-    // afterDecr = oldDebt - TEAM_CREDITS
-    // If afterDecr >= 0: we claimed a full TEAM_CREDITS of debt
-    // If afterDecr < 0: debt was less than TEAM_CREDITS, refund the excess
-    // If afterDecr <= -TEAM_CREDITS: there was no debt at all
-    const overclaim = Math.max(0, -afterDecr);
-    const debit = TEAM_CREDITS - overclaim;
-
-    if (debit <= 0) {
-      // No debt existed — restore counter and skip
-      await redis.incrby(key, TEAM_CREDITS);
-      return;
-    }
-
-    // Restore any excess we claimed beyond actual debt
-    if (overclaim > 0) {
-      await redis.incrby(key, overclaim);
-    }
-
-    // Burn the claimed debt from the user's bucket
-    try {
-      const { monthly } = createRateLimiter(redis, userId, "team");
-      await monthly.limiter.limit(monthly.key, { rate: debit });
-    } catch (burnError) {
-      // Bucket burn failed — restore the debt we claimed so it's not lost
-      await redis.incrby(key, debit);
-      // Clear the flag so a retry can re-attempt
-      await redis.del(flagKey);
-      throw burnError;
-    }
-  } catch (error) {
-    console.error(`[applyTeamSeatDebt] Failed for user ${userId}:`, error);
-  }
+  await redis.eval(
+    APPLY_TEAM_SEAT_DEBT_SCRIPT,
+    [
+      getMonthlyBucketKey(userId, "team"),
+      orgRemovedUsageKey(orgId),
+      debtAppliedKey(orgId, userId),
+    ],
+    [TEAM_CREDITS, Date.now(), THIRTY_DAYS_SECONDS],
+  );
 };
 
 // =============================================================================
@@ -2176,39 +2522,52 @@ export const applyTeamSeatDebt = async (
  * Refund usage when a request fails after credits were deducted.
  * Refunds both token bucket credits and extra usage balance.
  */
+export type UsageRefundResult = {
+  includedPointsRefunded: number;
+  extraUsagePointsRefunded: number;
+  includedRefundFailed: boolean;
+  extraUsageRefundFailed: boolean;
+};
+
 export const refundUsage = async (
   userId: string,
   subscription: SubscriptionTier,
   pointsDeducted: number,
   extraUsagePointsDeducted: number,
   organizationId?: string,
-): Promise<void> => {
-  const refundPromises: Promise<void>[] = [];
-
-  if (pointsDeducted > 0) {
-    refundPromises.push(
-      refundBucketTokens(userId, subscription, pointsDeducted),
-    );
-  }
-
-  if (extraUsagePointsDeducted > 0) {
+  includedRefundId: string = randomUUID(),
+): Promise<UsageRefundResult> => {
+  const includedRefundPromise =
+    pointsDeducted > 0
+      ? refundBucketTokens(
+          userId,
+          subscription,
+          pointsDeducted,
+          includedRefundId,
+        )
+      : Promise.resolve(true);
+  const extraUsageRefundPromise = (async () => {
+    if (extraUsagePointsDeducted <= 0) return true;
     const isTeamPool = subscription === "team" && !!organizationId;
-    refundPromises.push(
-      isTeamPool
-        ? refundToTeamBalance(
-            organizationId!,
-            userId,
-            extraUsagePointsDeducted,
-          ).then(() => {})
-        : refundToBalance(userId, extraUsagePointsDeducted).then(() => {}),
-    );
-  }
+    const result = isTeamPool
+      ? await refundToTeamBalance(
+          organizationId!,
+          userId,
+          extraUsagePointsDeducted,
+        )
+      : await refundToBalance(userId, extraUsagePointsDeducted);
+    return result.success;
+  })();
 
-  if (refundPromises.length > 0) {
-    try {
-      await Promise.all(refundPromises);
-    } catch (error) {
-      console.error("Failed to refund usage:", error);
-    }
-  }
+  const [includedRefunded, extraUsageRefunded] = await Promise.all([
+    includedRefundPromise,
+    extraUsageRefundPromise,
+  ]);
+
+  return {
+    includedPointsRefunded: includedRefunded ? pointsDeducted : 0,
+    extraUsagePointsRefunded: extraUsageRefunded ? extraUsagePointsDeducted : 0,
+    includedRefundFailed: pointsDeducted > 0 && !includedRefunded,
+    extraUsageRefundFailed: extraUsagePointsDeducted > 0 && !extraUsageRefunded,
+  };
 };

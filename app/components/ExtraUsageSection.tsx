@@ -14,6 +14,10 @@ import {
   AutoReloadDisabledAlert,
 } from "@/app/components/extra-usage";
 import {
+  getApproximateWeeklyExtraUsageSpend,
+  getRecommendedExtraUsagePurchaseAmount,
+} from "@/app/components/extra-usage/BuyExtraUsageDialog";
+import {
   captureAddCreditCtaClick,
   captureAddCreditCtaImpression,
   captureAuthenticatedEvent,
@@ -114,6 +118,12 @@ const ExtraUsageSection = () => {
         amountDollars,
         baseUrl: window.location.origin,
         checkoutAttemptId,
+        // Return to the stopped chat so its live balance can offer Continue.
+        // The pathname avoids forwarding transient checkout or pricing flags.
+        returnPath:
+          window.location.pathname.length <= 400
+            ? window.location.pathname
+            : "/",
       });
 
       if (result.url) {
@@ -203,6 +213,12 @@ const ExtraUsageSection = () => {
   const autoReloadDisabledReason = extraUsageSettings?.autoReloadDisabledReason;
   const monthlyCapDollars = extraUsageSettings?.monthlyCapDollars;
   const monthlySpentDollars = extraUsageSettings?.monthlySpentDollars ?? 0;
+  const recommendedPurchaseAmountDollars =
+    getRecommendedExtraUsagePurchaseAmount(
+      getApproximateWeeklyExtraUsageSpend(
+        extraUsageSettings?.monthlySpentDollars,
+      ),
+    );
   const effectiveCapDollars = monthlyCapDollars;
 
   useEffect(() => {
@@ -394,6 +410,7 @@ const ExtraUsageSection = () => {
         onOpenChange={setShowBuyDialog}
         onPurchase={handlePurchaseCredits}
         isLoading={isPurchasing}
+        recommendedAmountDollars={recommendedPurchaseAmountDollars}
       />
 
       <AdjustSpendingLimitDialog

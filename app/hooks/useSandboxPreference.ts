@@ -1,21 +1,31 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { useMutation } from "convex/react";
+import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { SandboxPreference } from "@/types/chat";
 import { toast } from "sonner";
-import { DesktopSandboxBridge } from "@/app/services/desktop-sandbox-bridge";
+import type { DesktopSandboxBridge } from "@/app/services/desktop-sandbox-bridge";
 import { isTauriEnvironment } from "@/app/hooks/useTauri";
+import { captureAuthenticatedEvent } from "@/lib/analytics/client";
+import { isEnvironmentPreference } from "@/lib/sandbox/environment";
 
 export type DesktopBridgeStatus =
   "idle" | "connecting" | "connected" | "failed";
 
+export type SetSandboxPreference = (
+  preference: SandboxPreference,
+  options?: { remember?: boolean },
+) => void;
+
 interface SandboxPreferenceState {
   sandboxPreference: SandboxPreference;
-  setSandboxPreference: (preference: SandboxPreference) => void;
+  hasExplicitSandboxPreference: boolean;
+  setSandboxPreference: SetSandboxPreference;
+  resetSandboxPreference: () => void;
   desktopBridgeActive: boolean;
   desktopBridgeStatus: DesktopBridgeStatus;
+  desktopEnvironmentId?: string;
   retryDesktopBridge: () => void;
 }
 
@@ -25,7 +35,56 @@ let bridgeStartPromise: Promise<DesktopSandboxBridge | null> | null = null;
 let bridgeGeneration = 0;
 let bridgeStateListener:
   ((active: boolean, status: DesktopBridgeStatus) => void) | null = null;
-const PERSISTABLE_SANDBOX_PREFERENCES = new Set(["e2b", "desktop"]);
+const DESKTOP_BRIDGE_RECOVERY_DELAYS_MS = [1_000, 3_000, 8_000, 16_000];
+const DESKTOP_BRIDGE_MAX_RECOVERY_ATTEMPTS = 6;
+const DESKTOP_BRIDGE_STABLE_RESET_MS = 60_000;
+type RecoverableDesktopTerminationReason =
+  "connection_not_found" | "connection_inactive" | "transport_disconnected";
+type DesktopBridgeRecoveryReason =
+  RecoverableDesktopTerminationReason | "startup_failed";
+const RECOVERABLE_DESKTOP_TERMINATIONS =
+  new Set<RecoverableDesktopTerminationReason>([
+    "connection_not_found",
+    "connection_inactive",
+    "transport_disconnected",
+  ]);
+
+function isRecoverableDesktopTermination(
+  reason: string,
+): reason is RecoverableDesktopTerminationReason {
+  return RECOVERABLE_DESKTOP_TERMINATIONS.has(
+    reason as RecoverableDesktopTerminationReason,
+  );
+}
+let bridgeRecoveryAttempt = 0;
+let bridgeRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+let bridgeStableResetTimer: ReturnType<typeof setTimeout> | null = null;
+// Only transient failures may be retried on wake/network recovery. Never
+// restart a bridge terminated by an authentication or ownership failure.
+let bridgeRecoveryExhausted = false;
+
+function clearBridgeRecovery(resetAttempt: boolean): void {
+  if (bridgeRecoveryTimer) {
+    clearTimeout(bridgeRecoveryTimer);
+    bridgeRecoveryTimer = null;
+  }
+  if (bridgeStableResetTimer) {
+    clearTimeout(bridgeStableResetTimer);
+    bridgeStableResetTimer = null;
+  }
+  if (resetAttempt) {
+    bridgeRecoveryAttempt = 0;
+  }
+}
+
+function scheduleStableRecoveryReset(generation: number): void {
+  if (bridgeStableResetTimer) clearTimeout(bridgeStableResetTimer);
+  bridgeStableResetTimer = setTimeout(() => {
+    bridgeStableResetTimer = null;
+    if (generation !== bridgeGeneration) return;
+    bridgeRecoveryAttempt = 0;
+  }, DESKTOP_BRIDGE_STABLE_RESET_MS);
+}
 
 export function useSandboxPreference(
   isAuthenticated: boolean,
@@ -34,17 +93,60 @@ export function useSandboxPreference(
   const [desktopBridgeStatus, setDesktopBridgeStatus] =
     useState<DesktopBridgeStatus>("idle");
   const [desktopBridgeRetryAttempt, setDesktopBridgeRetryAttempt] = useState(0);
+  const [desktopEnvironmentId, setDesktopEnvironmentId] = useState<string>();
 
   const [sandboxPreference, setSandboxPreferenceState] =
     useState<SandboxPreference>(() => {
       if (typeof window === "undefined") return "e2b";
       const stored = localStorage.getItem("sandbox-preference");
-      if (stored && stored !== "tauri") return stored as SandboxPreference;
-      // Default to Cloud on Desktop; user can switch to Local if desired
-      // if (activeBridge?.getConnectionId())
-      //   return activeBridge.getConnectionId()!;
-      return "e2b";
+      if (stored)
+        return stored === "tauri" ? "desktop" : (stored as SandboxPreference);
+      return isTauriEnvironment() ? "desktop" : "e2b";
     });
+
+  const [hasExplicitSandboxPreference, setHasExplicitSandboxPreference] =
+    useState(
+      () =>
+        typeof window !== "undefined" &&
+        Boolean(localStorage.getItem("sandbox-preference")),
+    );
+  const newChatPreferenceRef = useRef(sandboxPreference);
+  const resolvedPreference = useQuery(
+    api.localSandbox.resolveEnvironmentPreference,
+    isAuthenticated &&
+      sandboxPreference !== "desktop" &&
+      sandboxPreference !== "e2b" &&
+      !isEnvironmentPreference(sandboxPreference)
+      ? { preference: sandboxPreference }
+      : "skip",
+  );
+  const upgradedPreference =
+    sandboxPreference === "desktop" && desktopEnvironmentId
+      ? `desktop-environment:${desktopEnvironmentId}`
+      : resolvedPreference;
+  useEffect(() => {
+    if (
+      typeof upgradedPreference !== "string" ||
+      !isEnvironmentPreference(upgradedPreference)
+    )
+      return;
+    if (newChatPreferenceRef.current === sandboxPreference) {
+      newChatPreferenceRef.current = upgradedPreference;
+      if (localStorage.getItem("sandbox-preference") === sandboxPreference) {
+        localStorage.setItem("sandbox-preference", upgradedPreference);
+      }
+    }
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setSandboxPreferenceState((current) =>
+        current === sandboxPreference ? upgradedPreference : current,
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [upgradedPreference, sandboxPreference]);
 
   const connectDesktopMutation = useMutation(api.localSandbox.connectDesktop);
   const refreshTokenMutation = useMutation(
@@ -52,14 +154,22 @@ export function useSandboxPreference(
   );
   const disconnectMutation = useMutation(api.localSandbox.disconnectDesktop);
 
+  const heartbeatMutation = useMutation(api.localSandbox.heartbeatDesktop);
   const connectDesktopRef = useRef(connectDesktopMutation);
   const refreshTokenRef = useRef(refreshTokenMutation);
   const disconnectRef = useRef(disconnectMutation);
+  const heartbeatRef = useRef(heartbeatMutation);
   useEffect(() => {
     connectDesktopRef.current = connectDesktopMutation;
     refreshTokenRef.current = refreshTokenMutation;
     disconnectRef.current = disconnectMutation;
-  }, [connectDesktopMutation, refreshTokenMutation, disconnectMutation]);
+    heartbeatRef.current = heartbeatMutation;
+  }, [
+    connectDesktopMutation,
+    refreshTokenMutation,
+    disconnectMutation,
+    heartbeatMutation,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -76,13 +186,75 @@ export function useSandboxPreference(
         updateBridgeState(active, status);
       });
     };
+    const syncDesktopEnvironmentId = (environmentId: string | undefined) => {
+      queueMicrotask(() => {
+        if (!cancelled) setDesktopEnvironmentId(environmentId);
+      });
+    };
+    const scheduleBridgeRecovery = (
+      reason: DesktopBridgeRecoveryReason,
+      generation: number,
+    ): boolean => {
+      if (generation !== bridgeGeneration) return false;
+
+      clearBridgeRecovery(false);
+      if (bridgeRecoveryAttempt >= DESKTOP_BRIDGE_MAX_RECOVERY_ATTEMPTS) {
+        const attempts = bridgeRecoveryAttempt;
+        console.warn("[DesktopSandboxBridge] Automatic recovery exhausted", {
+          reason,
+          attempts,
+        });
+        captureAuthenticatedEvent("desktop_bridge_recovery_exhausted", {
+          clientSurface: "desktop_bridge",
+          reason,
+          attempts,
+        });
+        clearBridgeRecovery(true);
+        bridgeRecoveryExhausted = true;
+        updateBridgeState(false, "failed");
+        return true;
+      }
+
+      const delayMs =
+        DESKTOP_BRIDGE_RECOVERY_DELAYS_MS[
+          Math.min(
+            bridgeRecoveryAttempt,
+            DESKTOP_BRIDGE_RECOVERY_DELAYS_MS.length - 1,
+          )
+        ];
+      bridgeRecoveryAttempt += 1;
+      const attempt = bridgeRecoveryAttempt;
+      console.warn("[DesktopSandboxBridge] Automatic recovery scheduled", {
+        reason,
+        attempt,
+        delayMs,
+      });
+      captureAuthenticatedEvent("desktop_bridge_recovery_scheduled", {
+        clientSurface: "desktop_bridge",
+        reason,
+        attempt,
+        delayMs,
+      });
+      updateBridgeState(false, "connecting");
+      bridgeRecoveryTimer = setTimeout(() => {
+        bridgeRecoveryTimer = null;
+        if (generation !== bridgeGeneration) return;
+        bridgeGeneration += 1;
+        bridgeStartPromise = null;
+        setDesktopBridgeRetryAttempt((currentAttempt) => currentAttempt + 1);
+      }, delayMs);
+      return true;
+    };
 
     if (!isAuthenticated || !isTauriEnvironment()) {
+      bridgeRecoveryExhausted = false;
+      syncDesktopEnvironmentId(undefined);
       bridgeStateListener = null;
       bridgeGeneration += 1;
       bridgeStartPromise = null;
       const bridgeToStop = activeBridge;
       activeBridge = null;
+      clearBridgeRecovery(true);
       void bridgeToStop?.stop();
       syncBridgeState(false, "idle");
       return () => {
@@ -92,8 +264,9 @@ export function useSandboxPreference(
 
     bridgeStateListener = updateBridgeState;
 
-    // Already running — just sync bridge active state (keep Cloud as default)
+    // Already running — just sync bridge active state.
     if (activeBridge?.getConnectionId()) {
+      syncDesktopEnvironmentId(activeBridge.getEnvironmentId?.());
       syncBridgeState(true, "connected");
       // setSandboxPreferenceState(activeBridge.getConnectionId()!);
       return () => {
@@ -105,39 +278,60 @@ export function useSandboxPreference(
     }
 
     async function startBridge() {
+      const startGeneration = bridgeGeneration;
       setDesktopBridgeActive(false);
       setDesktopBridgeStatus("connecting");
       try {
         if (!bridgeStartPromise) {
-          const generation = bridgeGeneration;
-          let bridge: DesktopSandboxBridge;
-          bridge = new DesktopSandboxBridge({
-            connectDesktop: (args) => connectDesktopRef.current(args),
-            refreshCentrifugoTokenDesktop: (args) =>
-              refreshTokenRef.current(args),
-            disconnectDesktop: (args) => disconnectRef.current(args),
-            onTerminated: (reason) => {
-              if (generation !== bridgeGeneration) return;
-              if (activeBridge === bridge) activeBridge = null;
-              bridgeStateListener?.(false, "failed");
-            },
-          });
-
+          const generation = startGeneration;
           let startPromise: Promise<DesktopSandboxBridge | null>;
-          startPromise = bridge
-            .start()
-            .then(async () => {
-              if (generation !== bridgeGeneration) {
-                await bridge.stop();
-                return null;
-              }
-              activeBridge = bridge;
-              return bridge;
-            })
-            .catch(async (error) => {
-              await bridge.stop();
-              throw error;
-            })
+          startPromise = import("@/app/services/desktop-sandbox-bridge")
+            .then(
+              async ({ DesktopSandboxBridge: DesktopSandboxBridgeClass }) => {
+                if (generation !== bridgeGeneration) return null;
+
+                const bridge = new DesktopSandboxBridgeClass({
+                  connectDesktop: (args) => connectDesktopRef.current(args),
+                  refreshCentrifugoTokenDesktop: (args) =>
+                    refreshTokenRef.current(args),
+                  disconnectDesktop: (args) => disconnectRef.current(args),
+                  heartbeatDesktop: (args) => heartbeatRef.current(args),
+                  onConnectionState: (state) => {
+                    if (generation !== bridgeGeneration) return;
+                    if (state === "connected") {
+                      bridgeRecoveryExhausted = false;
+                      scheduleStableRecoveryReset(generation);
+                    }
+                    bridgeStateListener?.(state === "connected", state);
+                  },
+                  onTerminated: (reason) => {
+                    if (generation !== bridgeGeneration) return;
+                    if (activeBridge === bridge) activeBridge = null;
+                    if (!isRecoverableDesktopTermination(reason)) {
+                      bridgeRecoveryExhausted = false;
+                      clearBridgeRecovery(true);
+                      bridgeStateListener?.(false, "failed");
+                      return;
+                    }
+                    scheduleBridgeRecovery(reason, generation);
+                  },
+                });
+
+                try {
+                  await bridge.start();
+                } catch (error) {
+                  await bridge.stop();
+                  throw error;
+                }
+
+                if (generation !== bridgeGeneration) {
+                  await bridge.stop();
+                  return null;
+                }
+                activeBridge = bridge;
+                return bridge;
+              },
+            )
             .finally(() => {
               if (bridgeStartPromise === startPromise) {
                 bridgeStartPromise = null;
@@ -150,11 +344,16 @@ export function useSandboxPreference(
         if (cancelled || !bridge) return;
 
         setDesktopBridgeActive(true);
+        setDesktopEnvironmentId(bridge.getEnvironmentId?.());
         setDesktopBridgeStatus("connected");
-        // Keep Cloud selected by default; user can switch to Local if desired
-        // setSandboxPreferenceState(connectionId);
       } catch (error) {
         if (cancelled) return;
+        if (bridgeRecoveryTimer) {
+          setDesktopBridgeActive(false);
+          setDesktopBridgeStatus("connecting");
+          return;
+        }
+        if (scheduleBridgeRecovery("startup_failed", startGeneration)) return;
         console.error("[DesktopSandboxBridge] Failed to start:", error);
         setDesktopBridgeActive(false);
         setDesktopBridgeStatus("failed");
@@ -169,6 +368,7 @@ export function useSandboxPreference(
     // Cleanup on beforeunload (page close/refresh)
     const handleBeforeUnload = () => {
       bridgeGeneration += 1;
+      clearBridgeRecovery(true);
       bridgeStartPromise = null;
       bridgeStateListener = null;
       try {
@@ -191,38 +391,70 @@ export function useSandboxPreference(
     };
   }, [desktopBridgeRetryAttempt, isAuthenticated]);
 
-  const isFirstRender = useRef(true);
-  useEffect(() => {
-    if (isFirstRender.current) {
-      isFirstRender.current = false;
-      return;
-    }
-    if (
-      typeof window !== "undefined" &&
-      PERSISTABLE_SANDBOX_PREFERENCES.has(sandboxPreference)
-    ) {
-      localStorage.setItem("sandbox-preference", sandboxPreference);
-    }
-  }, [sandboxPreference]);
+  // Restoring a task or applying an availability/plan default must not change
+  // the user's default for new chats. Only an explicit choice is remembered.
+  const setSandboxPreference: SetSandboxPreference = useCallback(
+    (preference, { remember = true } = {}) => {
+      setSandboxPreferenceState(preference);
+      if (remember) {
+        setHasExplicitSandboxPreference(true);
+        newChatPreferenceRef.current = preference;
+        localStorage.setItem("sandbox-preference", preference);
+      }
+    },
+    [],
+  );
 
-  const setSandboxPreference = useCallback((preference: SandboxPreference) => {
-    setSandboxPreferenceState(preference);
+  const resetSandboxPreference = useCallback(() => {
+    setSandboxPreferenceState(newChatPreferenceRef.current);
   }, []);
 
   const retryDesktopBridge = useCallback(() => {
     if (!isAuthenticated || !isTauriEnvironment()) return;
     bridgeGeneration += 1;
+    bridgeRecoveryExhausted = false;
+    clearBridgeRecovery(true);
     bridgeStartPromise = null;
     setDesktopBridgeActive(false);
     setDesktopBridgeStatus("connecting");
     setDesktopBridgeRetryAttempt((attempt) => attempt + 1);
   }, [isAuthenticated]);
 
+  useEffect(() => {
+    if (!isAuthenticated || !isTauriEnvironment()) return;
+    const resumeRecovery = (event: Event) => {
+      if (
+        !bridgeRecoveryExhausted ||
+        (event.type !== "online" && document.visibilityState === "hidden") ||
+        activeBridge?.getConnectionId() ||
+        bridgeStartPromise ||
+        bridgeRecoveryTimer
+      )
+        return;
+      retryDesktopBridge();
+    };
+    window.addEventListener("online", resumeRecovery);
+    window.addEventListener("focus", resumeRecovery);
+    document.addEventListener("visibilitychange", resumeRecovery);
+    return () => {
+      window.removeEventListener("online", resumeRecovery);
+      window.removeEventListener("focus", resumeRecovery);
+      document.removeEventListener("visibilitychange", resumeRecovery);
+    };
+  }, [isAuthenticated, retryDesktopBridge]);
+
   return {
-    sandboxPreference,
+    sandboxPreference:
+      typeof upgradedPreference === "string" &&
+      isEnvironmentPreference(upgradedPreference)
+        ? upgradedPreference
+        : sandboxPreference,
+    hasExplicitSandboxPreference,
     setSandboxPreference,
+    resetSandboxPreference,
     desktopBridgeActive,
     desktopBridgeStatus,
+    desktopEnvironmentId,
     retryDesktopBridge,
   };
 }

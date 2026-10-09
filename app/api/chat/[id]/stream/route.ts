@@ -13,7 +13,7 @@ import {
 import { phLogger } from "@/lib/posthog/server";
 import { assertUserCanAccessChatHistory } from "@/lib/suspensions";
 
-export const maxDuration = 300;
+export const maxDuration = 800;
 
 export async function GET(
   req: NextRequest,
@@ -65,7 +65,6 @@ export async function GET(
   }
 
   const recentStreamId: string | undefined = chat.active_stream_id;
-  const isTemporary = chat.temporary === true;
 
   const emptyDataStream = createUIMessageStream<ChatMessage>({
     execute: () => {},
@@ -146,7 +145,6 @@ export async function GET(
         // Abort on explicit stop button click (via Redis pub/sub or polling)
         const cancellationSubscriber = await createCancellationSubscriber({
           chatId,
-          isTemporary,
           abortController,
           onStop: () => {},
         });

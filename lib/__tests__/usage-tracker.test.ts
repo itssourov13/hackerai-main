@@ -130,7 +130,7 @@ describe("UsageTracker", () => {
       expect(tracker.cacheHitRate).toBeNull();
     });
 
-    it("should compute hit rate as reads / (reads + writes)", () => {
+    it("should compute hit rate as cache reads / all input tokens", () => {
       tracker.accumulateStep({
         inputTokens: 100,
         inputTokenDetails: { cacheReadTokens: 80, cacheWriteTokens: 20 },
@@ -146,12 +146,12 @@ describe("UsageTracker", () => {
       expect(tracker.cacheHitRate).toBe(0);
     });
 
-    it("should return 1 when all reads and no writes", () => {
+    it("should not treat missing cache-write tokens as a 100% hit", () => {
       tracker.accumulateStep({
         inputTokens: 100,
-        inputTokenDetails: { cacheReadTokens: 100, cacheWriteTokens: 0 },
+        inputTokenDetails: { cacheReadTokens: 80, cacheWriteTokens: 0 },
       });
-      expect(tracker.cacheHitRate).toBe(1);
+      expect(tracker.cacheHitRate).toBe(0.8);
     });
 
     it("should accumulate across steps", () => {
@@ -163,8 +163,29 @@ describe("UsageTracker", () => {
         inputTokens: 100,
         inputTokenDetails: { cacheReadTokens: 40, cacheWriteTokens: 10 },
       });
-      // total: reads=100, writes=50 → rate = 100/150 ≈ 0.667
-      expect(tracker.cacheHitRate).toBeCloseTo(0.667, 2);
+      // total: reads=100, input=200 → rate = 100/200 = 0.5
+      expect(tracker.cacheHitRate).toBe(0.5);
+    });
+
+    it("should return 0 when the provider reports cache telemetry with no hit", () => {
+      tracker.accumulateStep({
+        inputTokens: 100,
+        inputTokenDetails: { cacheReadTokens: 0, cacheWriteTokens: 0 },
+      });
+      expect(tracker.cacheHitRate).toBe(0);
+    });
+
+    it("should ignore malformed cache telemetry", () => {
+      tracker.accumulateStep({
+        inputTokens: 100,
+        inputTokenDetails: {
+          cacheReadTokens: null as unknown as number,
+          cacheWriteTokens: Number.NaN,
+        },
+      });
+      expect(tracker.cacheReadTokens).toBe(0);
+      expect(tracker.cacheWriteTokens).toBe(0);
+      expect(tracker.cacheHitRate).toBeNull();
     });
   });
 
@@ -185,6 +206,14 @@ describe("UsageTracker", () => {
       tracker.accumulateStep({
         inputTokens: 100,
         inputTokenDetails: { cacheWriteTokens: 10 },
+      });
+      expect(tracker.hasCacheData).toBe(true);
+    });
+
+    it("should return true when the provider explicitly reports zero cache tokens", () => {
+      tracker.accumulateStep({
+        inputTokens: 100,
+        inputTokenDetails: { cacheReadTokens: 0, cacheWriteTokens: 0 },
       });
       expect(tracker.hasCacheData).toBe(true);
     });
@@ -304,7 +333,7 @@ describe("UsageTracker", () => {
       expect(tracker.computeCostDollars("model-default")).toBeCloseTo(0.00036);
     });
 
-    it("should use token estimates when any model step lacks authoritative cost", () => {
+    it("should estimate only the model step lacking authoritative cost", () => {
       const firstStepCostIndex = tracker.accumulateStep({
         inputTokens: 500_000,
         outputTokens: 0,
@@ -318,7 +347,64 @@ describe("UsageTracker", () => {
 
       tracker.setAuthoritativeModelCostForStep(firstStepCostIndex, 0.00016);
 
-      expect(tracker.computeCostDollars("model-default")).toBe(0.5);
+      expect(tracker.computeCostDollars("model-default")).toBeCloseTo(0.25016);
+      expect(tracker.hasAnyAuthoritativeModelCost).toBe(true);
+      expect(tracker.hasAuthoritativeModelCost).toBe(false);
+    });
+
+    it("uses each step's served model and cache rates for hybrid cost", () => {
+      const firstStepCostIndex = tracker.accumulateStep(
+        {
+          inputTokens: 1_000_000,
+          outputTokens: 0,
+        },
+        "model-deepseek-v4-pro",
+      );
+      tracker.setAuthoritativeModelCostForStep(firstStepCostIndex, 0.1);
+      tracker.accumulateStep(
+        {
+          inputTokens: 1_000_000,
+          outputTokens: 100_000,
+          inputTokenDetails: { cacheReadTokens: 800_000 },
+        },
+        "model-grok-4.6",
+      );
+
+      // Known DeepSeek step: $0.10.
+      // Missing Grok 4.6 long-context step: 200k uncached input ($0.80),
+      // 800k cache reads ($0.80), and 100k output ($1.20).
+      expect(
+        tracker.computeCostDollars("agent-model", "model-grok-4.6"),
+      ).toBeCloseTo(2.9);
+
+      const usage = tracker.createUsageCostRecord({
+        selectedModel: "agent-model",
+        configuredModelId: "x-ai/grok-4.6",
+        accountingModel: "model-grok-4.6",
+        rateLimitInfo: {
+          remaining: 1000,
+          resetTime: new Date(),
+          limit: 250000,
+          pointsDeducted: 100,
+        },
+      });
+      expect(usage.costSource).toBe("hybrid");
+    });
+
+    it("applies DeepSeek cache-read pricing to raw step estimates", () => {
+      tracker.accumulateStep(
+        {
+          inputTokens: 1_000_000,
+          outputTokens: 100_000,
+          inputTokenDetails: { cacheReadTokens: 900_000 },
+        },
+        "model-deepseek-v4-pro",
+      );
+
+      // 100k uncached input + 900k cache reads + 100k output.
+      expect(
+        tracker.computeCostDollars("model-deepseek-v4-pro", "model-grok-4.6"),
+      ).toBeCloseTo(0.1337625);
     });
 
     it("should prefer authoritative metadata cost over raw provider cost while preserving non-model spend", () => {
@@ -573,8 +659,7 @@ describe("UsageTracker", () => {
           logUsageRecord: localMockLog,
         }));
         jest.doMock("@/lib/rate-limit", () => ({
-          calculateRawTokenCost: jest.fn(),
-          POINTS_PER_DOLLAR: 10_000,
+          calculateRawModelUsageCostDollars: jest.fn(),
         }));
         IsolatedTracker = require("../usage-tracker").UsageTracker;
       });
@@ -588,6 +673,7 @@ describe("UsageTracker", () => {
 
       t.log({
         userId: "user-123",
+        assistantMessageId: "assistant-message-123",
         selectedModel: "model-default",
         configuredModelId: "model-config",
         rateLimitInfo: {
@@ -603,6 +689,7 @@ describe("UsageTracker", () => {
         userId: "user-123",
         organizationId: undefined,
         chatId: undefined,
+        assistantMessageId: "assistant-message-123",
         endpoint: undefined,
         mode: undefined,
         subscription: undefined,
@@ -614,11 +701,9 @@ describe("UsageTracker", () => {
         includedPointsDeducted: 100,
         extraUsagePointsDeducted: 0,
         uncoveredPoints: 0,
-        usageDeductionFailed: false,
         usageDeductionFailureReason: undefined,
         inputTokens: 1000,
         outputTokens: 500,
-        totalTokens: 1500,
         cacheReadTokens: undefined,
         cacheWriteTokens: undefined,
         costDollars: 0.01,
@@ -654,8 +739,8 @@ describe("UsageTracker", () => {
 
       const usage = tracker.createUsageCostRecord({
         selectedModel: "agent-model-free",
-        accountingModel: "model-kimi-k2.7-code",
-        configuredModelId: "x-ai/grok-4.5",
+        accountingModel: "model-kimi-k3",
+        configuredModelId: "x-ai/grok-4.6",
         rateLimitInfo: {
           remaining: 1000,
           resetTime: new Date(),
@@ -665,8 +750,8 @@ describe("UsageTracker", () => {
       });
 
       expect(usage.model).toBe("auto");
-      expect(usage.modelCostDollars).toBe(4.95);
-      expect(usage.costDollars).toBe(4.95);
+      expect(usage.modelCostDollars).toBe(18);
+      expect(usage.costDollars).toBe(18);
       expect(usage.costSource).toBe("raw_token_estimate");
     });
 
@@ -679,8 +764,8 @@ describe("UsageTracker", () => {
 
       const usage = tracker.createUsageCostRecord({
         selectedModel: "agent-model-free",
-        accountingModel: "model-kimi-k2.7-code",
-        configuredModelId: "x-ai/grok-4.5",
+        accountingModel: "model-kimi-k3",
+        configuredModelId: "x-ai/grok-4.6",
         rateLimitInfo: {
           remaining: 1000,
           resetTime: new Date(),
@@ -747,8 +832,8 @@ describe("UsageTracker", () => {
 
       const usage = tracker.createUsageCostRecord({
         selectedModel: "agent-model-free",
-        accountingModel: "model-kimi-k2.7-code",
-        configuredModelId: "x-ai/grok-4.5",
+        accountingModel: "model-kimi-k3",
+        configuredModelId: "x-ai/grok-4.6",
         rateLimitInfo: {
           remaining: 1000,
           resetTime: new Date(),
@@ -764,15 +849,19 @@ describe("UsageTracker", () => {
     });
 
     it("preserves summarization usage across fallback reset", () => {
-      tracker.inputTokens = 1_200;
-      tracker.summarizationInputTokens = 200;
-      tracker.outputTokens = 140;
-      tracker.summarizationOutputTokens = 40;
-      tracker.totalTokens = 1_340;
-      tracker.cacheReadTokens = 90;
-      tracker.summarizationCacheReadTokens = 20;
-      tracker.cacheWriteTokens = 50;
-      tracker.summarizationCacheWriteTokens = 10;
+      tracker.accumulateSummarization({
+        inputTokens: 200,
+        outputTokens: 40,
+        cacheReadTokens: 20,
+        cacheWriteTokens: 10,
+        model: "anthropic/claude-4.6-opus-20260205",
+      });
+      tracker.accumulateStep({
+        inputTokens: 1_000,
+        outputTokens: 100,
+        inputTokenDetails: { cacheReadTokens: 70, cacheWriteTokens: 40 },
+        raw: { cost: 0.25 },
+      });
 
       tracker.resetModelLeg();
 
@@ -782,6 +871,10 @@ describe("UsageTracker", () => {
       expect(tracker.cacheReadTokens).toBe(20);
       expect(tracker.cacheWriteTokens).toBe(10);
       expect(tracker.streamOutputTokens).toBe(0);
+      expect(tracker.providerCost).toBe(0);
+      expect(tracker.computeCostDollars("model-default")).toBeCloseTo(
+        0.0019225,
+      );
     });
 
     it("labels post-run overflow as mixed when final deduction uses extra usage", () => {

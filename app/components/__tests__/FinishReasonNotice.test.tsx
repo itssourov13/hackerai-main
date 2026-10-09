@@ -1,13 +1,56 @@
+jest.mock("../BlockedChatBillingRecovery", () => ({
+  BlockedChatBillingRecovery: ({
+    children,
+  }: {
+    children: import("react").ReactNode;
+  }) => children,
+}));
 import "@testing-library/jest-dom";
 import { describe, it, expect, jest } from "@jest/globals";
 import React from "react";
-import { render, screen, fireEvent } from "@testing-library/react";
+import {
+  act,
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+} from "@testing-library/react";
 
-import { FinishReasonNotice } from "../FinishReasonNotice";
 import { DataStreamProvider, useDataStream } from "../DataStreamProvider";
 import { MAX_AUTO_CONTINUES } from "@/app/hooks/useAutoContinue";
 import { POST_SUMMARIZATION_INCOMPLETE_FINISH_REASON } from "@/lib/chat/stop-conditions";
 import type { ChatMode, SelectedModel } from "@/types/chat";
+
+jest.mock("@/app/contexts/GlobalState", () => ({
+  useGlobalState: () => ({ subscription: "pro", isCheckingProPlan: false }),
+}));
+jest.mock("convex/react", () => ({
+  useQuery: () => ({
+    extraUsageAvailable: false,
+    reason: "empty",
+    hasBalance: false,
+    autoReloadEnabled: false,
+  }),
+  useAction: () => jest.fn(),
+}));
+jest.mock("@workos-inc/authkit-nextjs/components", () => ({
+  useAuth: () => ({ user: { id: "test-user" } }),
+}));
+jest.mock("swr", () => ({
+  __esModule: true,
+  default: () => ({
+    data: { monthly: { remaining: 0 } },
+    isLoading: false,
+  }),
+}));
+jest.mock("@/app/hooks/usePricingDialog", () => ({
+  redirectToPricing: jest.fn(),
+}));
+jest.mock("@/lib/utils/settings-dialog", () => ({
+  openSettingsDialog: jest.fn(),
+}));
+
+const { FinishReasonNotice } = require("../FinishReasonNotice");
 
 function DataStreamSetter({
   isAutoResuming,
@@ -134,7 +177,7 @@ describe("FinishReasonNotice", () => {
       },
       {
         finishReason: "budget-exhausted",
-        expectedText: "Stopped at a usage guardrail for this run",
+        expectedText: "This run stopped when your usage limit was reached",
       },
       {
         finishReason: POST_SUMMARIZATION_INCOMPLETE_FINISH_REASON,
@@ -162,6 +205,12 @@ describe("FinishReasonNotice", () => {
           /The response reached its output limit before finishing.*Continue to resume where it stopped/i,
         ),
       ).toBeInTheDocument();
+    });
+
+    it("confirms that completed work was preserved at the step limit", () => {
+      renderNotice({ finishReason: "tool-calls", mode: "agent" });
+
+      expect(screen.getByText(/Completed work was saved/i)).toBeInTheDocument();
     });
 
     it.each([
@@ -302,7 +351,7 @@ describe("FinishReasonNotice", () => {
       expect(onContinue).toHaveBeenCalledWith(undefined);
     });
 
-    it("renders a usage guardrail notice without a Continue button for budget exhaustion", () => {
+    it("offers recovery and resumes through the normal continuation handler after budget exhaustion", () => {
       const onContinue = jest.fn();
       renderNotice(
         {
@@ -314,11 +363,17 @@ describe("FinishReasonNotice", () => {
       );
 
       expect(
-        screen.getByText(/Stopped at a usage guardrail for this run/i),
+        screen.getByText(/This run stopped when your usage limit was reached/i),
       ).toBeInTheDocument();
       expect(
         screen.queryByRole("button", { name: /continue/i }),
       ).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Add credits" })).toBeEnabled();
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      expect(onContinue).toHaveBeenCalledTimes(1);
+      expect(onContinue).toHaveBeenCalledWith(undefined);
+      // A rejected attempt must not permanently hide the recovery actions.
+      expect(screen.getByRole("button", { name: "Add credits" })).toBeEnabled();
     });
   });
 
@@ -347,4 +402,36 @@ describe("FinishReasonNotice", () => {
       expect(outerDiv).toHaveClass("mt-2", "w-full");
     });
   });
+});
+
+it.each(["step-limit", "trigger_crashed_client_saved"])(
+  "offers recovery for %s",
+  (finishReason) => {
+    renderNotice({ finishReason, onContinue: jest.fn() });
+    expect(
+      screen.getByRole("button", { name: /Continue|Resume task/ }),
+    ).toBeEnabled();
+  },
+);
+
+it("keeps recovery available after a rejected continuation and prevents double clicks", async () => {
+  let reject!: (error: Error) => void;
+  const onContinue = jest.fn(
+    () =>
+      new Promise<void>((_, fail) => {
+        reject = fail;
+      }),
+  );
+  renderNotice({ finishReason: "step-limit", onContinue });
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+  const pending = screen.getByRole("button", { name: "Resuming…" });
+  expect(pending).toBeDisabled();
+  fireEvent.click(pending);
+  expect(onContinue).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    reject(new Error("offline"));
+  });
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled(),
+  );
 });

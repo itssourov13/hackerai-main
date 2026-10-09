@@ -1,5 +1,6 @@
 import type { UIToolInvocation } from "ai";
 import { ChatMessage } from "@/types/chat";
+import { getIncompleteToolErrorText } from "@/lib/chat/tool-abort-utils";
 
 /**
  * Checks if a part is a completed reasoning block with redacted text.
@@ -39,6 +40,7 @@ interface BaseToolPart {
   input?: any;
   output?: any;
   result?: any; // legacy
+  errorText?: string;
 }
 
 // Specific interface for terminal tools that have special data handling
@@ -95,6 +97,7 @@ interface DataPart {
  */
 export const normalizeMessages = (
   messages: ChatMessage[],
+  options?: { userInitiatedAbort?: boolean },
 ): {
   messages: ChatMessage[];
   lastMessage: ChatMessage[];
@@ -174,6 +177,7 @@ export const normalizeMessages = (
         const transformedPart = transformTerminalToolPart(
           part as TerminalToolPart,
           terminalDataMap,
+          options?.userInitiatedAbort,
         );
         processedParts.push(transformedPart);
         messageChanged = true;
@@ -213,6 +217,7 @@ export const normalizeMessages = (
 const transformTerminalToolPart = (
   terminalPart: TerminalToolPart,
   terminalDataMap: Map<string, string>,
+  userInitiatedAbort = false,
 ): BaseToolPart => {
   const stdout = terminalDataMap.get(terminalPart.toolCallId) || "";
 
@@ -221,27 +226,26 @@ const transformTerminalToolPart = (
     return {
       type: "tool-shell",
       toolCallId: terminalPart.toolCallId,
-      state: "output-available",
+      state: "output-error",
       input: terminalPart.input,
+      errorText: getIncompleteToolErrorText(undefined, userInitiatedAbort),
       output: {
-        output:
-          stdout ||
-          (stdout.length === 0 ? "Command was stopped/aborted by user" : ""),
+        output: stdout,
       },
     };
   }
 
   return {
-    type: "tool-run_terminal_cmd",
+    type: terminalPart.type,
     toolCallId: terminalPart.toolCallId,
-    state: "output-available",
+    state: "output-error",
     input: terminalPart.input,
+    errorText: getIncompleteToolErrorText(undefined, userInitiatedAbort),
     output: {
       result: {
-        exitCode: 130, // Standard exit code for SIGINT (interrupted)
+        ...(userInitiatedAbort ? { exitCode: 130 } : {}),
         stdout: stdout,
-        stderr:
-          stdout.length === 0 ? "Command was stopped/aborted by user" : "",
+        stderr: "",
       },
     },
   };

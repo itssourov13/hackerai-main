@@ -1,8 +1,13 @@
 import {
   createAgentToolSchemaSet,
   createFileToolSchema,
+  createGetTerminalFilesToolSchema,
+  createInteractTerminalSessionToolSchema,
+  createOpenUrlToolSchema,
   createRunTerminalCmdToolSchema,
+  createWebSearchToolSchema,
   runTerminalCmdTool,
+  todoWriteTool,
 } from "../schemas";
 
 const getDescription = (value: unknown): string =>
@@ -18,6 +23,12 @@ describe("agent tool schema descriptions", () => {
     expect(fullAccessDescription).not.toContain("ask the user to approve it");
     expect(fullAccessDescription).toContain(
       "Use command chaining and pipes for efficiency",
+    );
+    expect(fullAccessDescription).toContain(
+      "Process running with session ID X",
+    );
+    expect(fullAccessDescription).toContain(
+      "a detached PID is not a reusable terminal session",
     );
     expect(fullAccessDescription).toContain("append ` | cat` to the command");
 
@@ -79,6 +90,25 @@ describe("agent tool schema descriptions", () => {
     );
   });
 
+  test("keeps inline line-number parsing guidance with the file tool", () => {
+    const fileTool = createFileToolSchema({ supportsView: true });
+
+    expect(getDescription(fileTool)).toContain("LINE_NUMBER|LINE_CONTENT");
+    expect(getDescription(fileTool)).toContain(
+      "Treat LINE_NUMBER| as metadata, not as part of the file content.",
+    );
+  });
+
+  test("keeps task-management completion guidance with the todo tool", () => {
+    expect(getDescription(todoWriteTool)).toContain(
+      "### When to Use This Tool",
+    );
+    expect(getDescription(todoWriteTool)).toContain("### When NOT to Use");
+    expect(getDescription(todoWriteTool)).toContain(
+      "Keep unfinished work pending or in_progress across turns, pauses, limits, and summarization.",
+    );
+  });
+
   test("always exposes image view in the Agent schema catalog", () => {
     const agentTools = createAgentToolSchemaSet();
     const fileInputShape = getInputShape(agentTools.file);
@@ -90,5 +120,39 @@ describe("agent tool schema descriptions", () => {
     expect(createAgentToolSchemaSet({ mode: "ask" })).not.toHaveProperty(
       "file",
     );
+  });
+
+  test("passes the active model into every brief-bearing tool schema", () => {
+    const createBriefBearingTools = (modelName: string) => ({
+      run_terminal_cmd: createRunTerminalCmdToolSchema({ modelName }),
+      interact_terminal_session: createInteractTerminalSessionToolSchema({
+        modelName,
+      }),
+      get_terminal_files: createGetTerminalFilesToolSchema({ modelName }),
+      file: createFileToolSchema({ supportsView: true, modelName }),
+      web_search: createWebSearchToolSchema({ modelName }),
+      open_url: createOpenUrlToolSchema({ modelName }),
+    });
+    const deepSeekTools = createBriefBearingTools("model-deepseek-v4-pro-0813");
+    const otherTools = createBriefBearingTools("model-grok-4.6");
+
+    for (const toolName of [
+      "run_terminal_cmd",
+      "interact_terminal_session",
+      "get_terminal_files",
+      "file",
+      "web_search",
+      "open_url",
+    ] as const) {
+      const deepSeekBrief = getInputShape(deepSeekTools[toolName]).brief as {
+        description: string;
+      };
+      const otherBrief = getInputShape(otherTools[toolName]).brief as {
+        description: string;
+      };
+
+      expect(deepSeekBrief.description).toContain("English only");
+      expect(otherBrief.description).not.toContain("English only");
+    }
   });
 });

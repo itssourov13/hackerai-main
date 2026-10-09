@@ -1,11 +1,19 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { validateServiceKey } from "./lib/utils";
+import { getActiveChatAccessBlockingSuspension } from "./lib/chatAccessSuspensions";
 
 const suspensionCategoryValidator = v.union(
   v.literal("early_fraud_warning"),
   v.literal("dispute_fraudulent"),
   v.literal("dispute_billing_hold"),
+  v.literal("support_confirmed_fraud"),
+  v.literal("security_abuse"),
+);
+
+const suspensionSourceValidator = v.union(
+  v.literal("stripe"),
+  v.literal("support"),
 );
 
 export const getActiveByUser = query({
@@ -47,20 +55,40 @@ export const getActiveFraudDisputeByUser = query({
   },
 });
 
+export const getActiveChatAccessBlockByUser = query({
+  args: {
+    serviceKey: v.string(),
+    userId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    validateServiceKey(args.serviceKey);
+    return await getActiveChatAccessBlockingSuspension(ctx, args.userId);
+  },
+});
+
 export const upsertActive = mutation({
   args: {
     serviceKey: v.string(),
     userId: v.string(),
     category: suspensionCategoryValidator,
+    source: v.optional(suspensionSourceValidator),
     sourceId: v.string(),
     sourceReason: v.optional(v.string()),
-    stripeCustomerId: v.string(),
+    stripeCustomerId: v.optional(v.string()),
     stripeChargeId: v.optional(v.string()),
     workosOrganizationId: v.optional(v.string()),
     sourceCreatedAt: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     validateServiceKey(args.serviceKey);
+
+    if (args.category === "security_abuse") {
+      if (args.source !== "support") {
+        throw new Error("Security suspensions must be issued by support");
+      }
+    } else if (!args.stripeCustomerId) {
+      throw new Error("Billing suspensions require a Stripe customer");
+    }
 
     const now = Date.now();
     const existing = await ctx.db
@@ -73,7 +101,7 @@ export const upsertActive = mutation({
     const fields = {
       status: "active" as const,
       category: args.category,
-      source: "stripe" as const,
+      source: args.source ?? ("stripe" as const),
       source_id: args.sourceId,
       source_reason: args.sourceReason,
       stripe_customer_id: args.stripeCustomerId,

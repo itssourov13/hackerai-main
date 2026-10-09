@@ -1,0 +1,245 @@
+import assert from "node:assert/strict";
+import { createServer, request as httpRequest } from "node:http";
+import { connect } from "node:net";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, before, test } from "node:test";
+import {
+  createProxyDispatcher,
+  formatGatewayError,
+  gatewayRequest,
+  loadResearchKey,
+} from "./run-research.mjs";
+
+async function localKeyFixture(t, value) {
+  const homeDir = await mkdtemp(join(tmpdir(), "pm-research-key-test-"));
+  t.after(() => rm(homeDir, { recursive: true, force: true }));
+  const keyPath = join(homeDir, ".config", "hackerai", "pm-research.key");
+  await mkdir(join(homeDir, ".config", "hackerai"), { recursive: true });
+  if (value !== undefined) await writeFile(keyPath, value, { mode: 0o600 });
+  return { homeDir, keyPath };
+}
+
+test("loads the machine key without an exported environment variable", async (t) => {
+  const { homeDir } = await localKeyFixture(t, "synthetic-local-key\n");
+  assert.equal(
+    await loadResearchKey({ homeDir, env: {} }),
+    "synthetic-local-key",
+  );
+  assert.equal(
+    await loadResearchKey({
+      homeDir,
+      env: { HACKERAI_PM_USER_RESEARCH_KEY: "synthetic-env-key" },
+    }),
+    "synthetic-local-key",
+  );
+});
+
+test("falls back to the environment only when the local file is absent", async (t) => {
+  const { homeDir } = await localKeyFixture(t);
+  assert.equal(
+    await loadResearchKey({
+      homeDir,
+      env: { HACKERAI_PM_USER_RESEARCH_KEY: "synthetic-env-key\n" },
+    }),
+    "synthetic-env-key",
+  );
+  await assert.rejects(
+    loadResearchKey({ homeDir, env: {} }),
+    /key not found: checked/,
+  );
+});
+
+test("rejects malformed local keys without exposing values or using the environment", async (t) => {
+  for (const value of [
+    "",
+    "\n",
+    "private-test-value\nsecond-token",
+    "private-test-value with spaces",
+  ]) {
+    const { homeDir } = await localKeyFixture(t, value);
+    await assert.rejects(
+      loadResearchKey({
+        homeDir,
+        env: { HACKERAI_PM_USER_RESEARCH_KEY: "synthetic-env-key" },
+      }),
+      (error) => {
+        assert.match(error.message, /nonempty single token/);
+        assert.doesNotMatch(
+          error.message,
+          /private-test-value|synthetic-env-key/,
+        );
+        return true;
+      },
+    );
+  }
+});
+
+test("rejects public, oversized, and non-file local credentials", async (t) => {
+  const { homeDir, keyPath } = await localKeyFixture(t, "synthetic-local-key");
+  await chmod(keyPath, 0o644);
+  await assert.rejects(
+    loadResearchKey({ homeDir, env: {} }),
+    /owner-only regular file/,
+  );
+  await chmod(keyPath, 0o600);
+  await writeFile(keyPath, "x".repeat(4097));
+  await assert.rejects(
+    loadResearchKey({ homeDir, env: {} }),
+    /larger than 4 KiB/,
+  );
+  await rm(keyPath);
+  await mkdir(keyPath, { mode: 0o700 });
+  await assert.rejects(
+    loadResearchKey({ homeDir, env: {} }),
+    /owner-only regular file/,
+  );
+});
+
+let origin;
+let proxy;
+let originUrl;
+let proxyUrl;
+let proxyRequests = 0;
+
+before(async () => {
+  origin = createServer((request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({ authorization: request.headers.authorization }),
+    );
+  });
+  await new Promise((resolve) => origin.listen(0, "127.0.0.1", resolve));
+  const originAddress = origin.address();
+  originUrl = `http://127.0.0.1:${originAddress.port}/research`;
+
+  proxy = createServer((request, response) => {
+    proxyRequests += 1;
+    const target = new URL(request.url);
+    const forwarded = httpRequest(
+      target,
+      { method: request.method, headers: request.headers },
+      (upstream) => {
+        response.writeHead(upstream.statusCode ?? 500, upstream.headers);
+        upstream.pipe(response);
+      },
+    );
+    request.pipe(forwarded);
+  });
+  proxy.on("connect", (request, clientSocket, head) => {
+    proxyRequests += 1;
+    const [host, port] = request.url.split(":");
+    const upstreamSocket = connect(Number(port), host, () => {
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length > 0) upstreamSocket.write(head);
+      upstreamSocket.pipe(clientSocket);
+      clientSocket.pipe(upstreamSocket);
+    });
+  });
+  await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  const proxyAddress = proxy.address();
+  proxyUrl = `http://127.0.0.1:${proxyAddress.port}`;
+});
+
+after(async () => {
+  await Promise.all([
+    new Promise((resolve, reject) =>
+      origin.close((error) => (error ? reject(error) : resolve())),
+    ),
+    new Promise((resolve, reject) =>
+      proxy.close((error) => (error ? reject(error) : resolve())),
+    ),
+  ]);
+});
+
+test("gateway requests use the configured HTTP proxy", async () => {
+  const dispatcher = createProxyDispatcher({
+    HTTP_PROXY: proxyUrl,
+    NO_PROXY: "",
+  });
+
+  try {
+    const body = await gatewayRequest(
+      originUrl,
+      "synthetic-test-key",
+      {},
+      {
+        dispatcher,
+      },
+    );
+
+    assert.equal(proxyRequests, 1);
+    assert.equal(body.authorization, "Bearer synthetic-test-key");
+  } finally {
+    await dispatcher.close();
+  }
+});
+
+test("gateway requests do not create a dispatcher without proxy variables", () => {
+  assert.equal(createProxyDispatcher({}), undefined);
+});
+
+test("gateway errors include bounded validation details without rejected input", async () => {
+  await assert.rejects(
+    gatewayRequest(
+      originUrl,
+      "synthetic-test-key",
+      {},
+      {
+        request: async () =>
+          new Response(
+            JSON.stringify({
+              error: "invalid_payload",
+              issues: [
+                {
+                  code: "invalid_type",
+                  path: ["cohortSelectedAt", "private-rejected-input"],
+                  message: "Rejected private value private-rejected-input",
+                  input: "private rejected input",
+                },
+              ],
+            }),
+            {
+              status: 400,
+              headers: { "content-type": "application/json" },
+            },
+          ),
+      },
+    ),
+    (error) => {
+      assert.match(
+        error.message,
+        /cohortSelectedAt\.field: has an invalid type/,
+      );
+      assert.doesNotMatch(error.message, /private rejected input/);
+      assert.doesNotMatch(error.message, /private-rejected-input/);
+      return true;
+    },
+  );
+});
+
+test("gateway error formatting bounds issue count and message length", () => {
+  const error = formatGatewayError(400, {
+    error: "invalid_payload",
+    issues: Array.from({ length: 12 }, (_, index) => ({
+      path: ["field", index, ...Array.from({ length: 20 }, () => "nested")],
+      message: "x".repeat(500),
+    })),
+  });
+
+  assert.match(error, /^Research gateway returned 400: invalid_payload/);
+  assert.match(error, /field\.7\.nested/);
+  assert.doesNotMatch(error, /field\.8\.nested/);
+  assert.doesNotMatch(error, /(?:\.nested){7}/);
+  assert.ok(error.length < 2_300);
+});
+
+test("gateway error formatting allow-lists the top-level error code", () => {
+  const error = formatGatewayError(502, {
+    error: "private-rejected-input",
+    issues: [],
+  });
+
+  assert.equal(error, "Research gateway returned 502: request_failed");
+});

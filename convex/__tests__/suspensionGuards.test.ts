@@ -18,8 +18,10 @@ type SuspensionRow = {
   category:
     | "early_fraud_warning"
     | "dispute_fraudulent"
-    | "dispute_billing_hold";
-  source: "stripe";
+    | "dispute_billing_hold"
+    | "support_confirmed_fraud"
+    | "security_abuse";
+  source: "stripe" | "support";
   source_id: string;
   stripe_customer_id: string;
   created_at: number;
@@ -86,7 +88,7 @@ function makeMockCtx(rows: SuspensionRow[]) {
 }
 
 describe("suspensionGuards", () => {
-  it("allows chat history when the user has no active fraud dispute", async () => {
+  it("allows chat history when the user has no active chat-access block", async () => {
     const { assertUserCanAccessChatHistory } =
       await import("../lib/suspensionGuards");
     const { ctx, withIndex } = makeMockCtx([
@@ -141,19 +143,78 @@ describe("suspensionGuards", () => {
     });
   });
 
+  it("blocks chat history for support-confirmed fraud", async () => {
+    const { assertUserCanAccessChatHistory } =
+      await import("../lib/suspensionGuards");
+    const { ctx } = makeMockCtx([
+      makeSuspension({
+        category: "support_confirmed_fraud",
+        source: "support",
+        source_id: "support_case:intercom_456",
+      }),
+    ]);
+
+    await expect(
+      assertUserCanAccessChatHistory(ctx, "user_123"),
+    ).rejects.toMatchObject({
+      data: expect.objectContaining({
+        code: "CHAT_ACCESS_SUSPENDED",
+        message: expect.stringContaining("confirmed fraudulent payment"),
+        suspensionCategory: "support_confirmed_fraud",
+        suspensionSource: "support",
+      }),
+    });
+  });
+
+  it("blocks a security-banned user's history and shared chats with a clear reason", async () => {
+    const { assertUserCanAccessChatHistory, isUserBlockedFromChatHistory } =
+      await import("../lib/suspensionGuards");
+    const { ctx } = makeMockCtx([
+      makeSuspension({
+        category: "security_abuse",
+        source: "support",
+        source_id: "abuse_case_123",
+      }),
+    ]);
+    await expect(
+      assertUserCanAccessChatHistory(ctx, "user_123"),
+    ).rejects.toMatchObject({
+      data: expect.objectContaining({
+        code: "CHAT_ACCESS_SUSPENDED",
+        message: expect.stringContaining("security misuse"),
+        suspensionCategory: "security_abuse",
+      }),
+    });
+    await expect(isUserBlockedFromChatHistory(ctx, "user_123")).resolves.toBe(
+      true,
+    );
+    await expect(isUserBlockedFromChatHistory(ctx, "other_user")).resolves.toBe(
+      false,
+    );
+  });
+
   it("reports whether public shared chat reads should be blocked", async () => {
-    const { isUserBlockedByActiveFraudDispute } =
+    const { isUserBlockedFromChatHistory } =
       await import("../lib/suspensionGuards");
     const blocked = makeMockCtx([makeSuspension()]);
+    const supportBlocked = makeMockCtx([
+      makeSuspension({
+        category: "support_confirmed_fraud",
+        source: "support",
+      }),
+    ]);
     const allowed = makeMockCtx([
       makeSuspension({ category: "early_fraud_warning" }),
     ]);
 
     await expect(
-      isUserBlockedByActiveFraudDispute(blocked.ctx, "user_123"),
+      isUserBlockedFromChatHistory(blocked.ctx, "user_123"),
     ).resolves.toBe(true);
     await expect(
-      isUserBlockedByActiveFraudDispute(allowed.ctx, "user_123"),
+      isUserBlockedFromChatHistory(supportBlocked.ctx, "user_123"),
+    ).resolves.toBe(true);
+    await expect(
+      isUserBlockedFromChatHistory(allowed.ctx, "user_123"),
     ).resolves.toBe(false);
   });
 });

@@ -5,8 +5,9 @@ import {
   type AnySandbox,
 } from "@/types";
 import { ChatSDKError } from "@/lib/errors";
+import { localEnvironmentIdentity } from "@/lib/sandbox/environment";
 import type { SandboxFallbackInfo } from "./hybrid-sandbox-manager";
-import { isCentrifugoSandbox } from "./sandbox-types";
+import { isCentrifugoSandbox, isMiosaSandbox } from "./sandbox-types";
 
 type SandboxContextForPromptManager = {
   getSandboxInfo?: () => unknown;
@@ -43,6 +44,21 @@ const CLOUD_SANDBOX_TYPE = "e2b";
 const APPROVED_SANDBOX_CHANGED_MESSAGE =
   "The selected sandbox changed after approval. The operation was not run. Retry it to approve in the current sandbox.";
 
+export function getAgentApprovalSandboxIdentity(
+  sandbox: AnySandbox,
+): AgentApprovalSandboxIdentity {
+  if (isMiosaSandbox(sandbox)) return "miosa";
+  if (!isCentrifugoSandbox(sandbox)) return "e2b";
+
+  const connection =
+    typeof sandbox.getConnectionInfo === "function"
+      ? sandbox.getConnectionInfo()
+      : { connectionId: sandbox.getConnectionId() };
+  return getAgentApprovalConnectionSandboxIdentity(
+    localEnvironmentIdentity(connection),
+  );
+}
+
 export function assertAgentApprovalSandboxIdentity({
   sandbox,
   expectedSandboxIdentity,
@@ -52,9 +68,7 @@ export function assertAgentApprovalSandboxIdentity({
 }): void {
   if (!expectedSandboxIdentity) return;
 
-  const actualSandboxIdentity = isCentrifugoSandbox(sandbox)
-    ? getAgentApprovalConnectionSandboxIdentity(sandbox.getConnectionId())
-    : "e2b";
+  const actualSandboxIdentity = getAgentApprovalSandboxIdentity(sandbox);
   if (actualSandboxIdentity !== expectedSandboxIdentity) {
     throw new Error(APPROVED_SANDBOX_CHANGED_MESSAGE);
   }

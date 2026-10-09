@@ -1,3 +1,8 @@
+import { flushInfluencerAnalytics } from "@/lib/influencers/analytics";
+import {
+  attributeInfluencer,
+  partnerTrackingAllowed,
+} from "@/lib/influencers/attribution";
 import { stripe } from "../stripe";
 import { workos } from "../workos";
 import { getUserIDAndPro } from "@/lib/auth/get-user-id";
@@ -27,6 +32,17 @@ import {
   planLookupKeyToTier,
 } from "@/lib/analytics/paid-funnel";
 import { checkoutStartedEventUuid } from "@/lib/analytics/paid-funnel-server";
+import {
+  PRO_MONTHLY_PRICE_LOOKUP_KEY,
+  isCurrentProMonthlyPrice,
+} from "@/lib/pricing/pro-monthly";
+import {
+  PRO_YEARLY_PRICE_LOOKUP_KEY,
+  isCurrentProYearlyPrice,
+} from "@/lib/pricing/pro-yearly";
+import { hasActiveSuspensionForUser } from "@/lib/suspensions";
+import { BILLING_ERRORS } from "@/lib/billing/billing-errors";
+import { hasRecentCanceledRenewalAtRisk } from "@/lib/billing/canceled-renewal-invoice";
 
 function canManageOrganizationBilling(
   membership: Awaited<
@@ -52,17 +68,39 @@ function isReusableCheckoutSession(
   {
     organizationId,
     requestedPlan,
+    resolvedPriceLookupKey,
     quantity,
+    successUrl,
+    cancelUrl,
   }: {
     organizationId: string;
     requestedPlan: string;
+    resolvedPriceLookupKey: string;
     quantity: number;
+    successUrl: string;
+    cancelUrl: string;
   },
 ): boolean {
   if (!session.url) return false;
+  // Open Pro sessions can still hold a historical Price after lookup transfer.
+  if (
+    requestedPlan === PRO_MONTHLY_PRICE_LOOKUP_KEY ||
+    requestedPlan === PRO_YEARLY_PRICE_LOOKUP_KEY
+  )
+    return false;
+  if (session.success_url !== successUrl || session.cancel_url !== cancelUrl)
+    return false;
   if (session.metadata?.workOSOrganizationId !== organizationId) return false;
   if (session.metadata?.requestedPlan !== requestedPlan) return false;
-
+  const previousResolvedPriceLookupKey =
+    session.metadata?.resolvedPriceLookupKey;
+  if (
+    previousResolvedPriceLookupKey
+      ? previousResolvedPriceLookupKey !== resolvedPriceLookupKey
+      : resolvedPriceLookupKey !== requestedPlan
+  ) {
+    return false;
+  }
   const checkoutQuantity = session.metadata?.checkoutQuantity;
   return checkoutQuantity
     ? checkoutQuantity === String(quantity)
@@ -177,12 +215,18 @@ async function findReusableCheckoutSession({
   customerId,
   organizationId,
   requestedPlan,
+  resolvedPriceLookupKey,
   quantity,
+  successUrl,
+  cancelUrl,
 }: {
   customerId: string;
   organizationId: string;
   requestedPlan: string;
+  resolvedPriceLookupKey: string;
   quantity: number;
+  successUrl: string;
+  cancelUrl: string;
 }): Promise<Stripe.Checkout.Session | undefined> {
   let startingAfter: string | undefined;
 
@@ -197,7 +241,10 @@ async function findReusableCheckoutSession({
       isReusableCheckoutSession(candidate, {
         organizationId,
         requestedPlan,
+        resolvedPriceLookupKey,
         quantity,
+        successUrl,
+        cancelUrl,
       }),
     );
 
@@ -238,11 +285,22 @@ export const POST = async (req: NextRequest) => {
     const fromTier = paidFunnelTierFromUnknown(body?.fromTier);
     const posthogSessionId = req.headers.get("x-posthog-session-id");
     // Get user ID and subscription state from authenticated session
-    const { userId, subscription, freeQuotaSubject } =
+    const { userId, subscription, organizationId, freeQuotaSubject } =
       await getUserIDAndPro(req);
+
+    if (await hasActiveSuspensionForUser(userId)) {
+      return json({ error: BILLING_ERRORS.accountSuspended }, { status: 403 });
+    }
 
     // Get user details from WorkOS to create a personal organization.
     const user = await workos.userManagement.getUser(userId);
+    await attributeInfluencer(req, {
+      userId,
+      email: user.email,
+      identity: freeQuotaSubject,
+      subscription,
+      createdAt: user.createdAt,
+    });
     const orgName = buildWorkOSOrganizationName(user);
     const referralConfig = getReferralRewardConfig();
     const referralCode = req.cookies.get(REFERRAL_COOKIE_NAME)?.value;
@@ -320,6 +378,7 @@ export const POST = async (req: NextRequest) => {
             | "team-monthly-plan"
             | "team-yearly-plan")
         : "pro-monthly-plan";
+    const resolvedPriceLookupKey = subscriptionLevel;
 
     // Quantity is only used for team plans, defaults to 1 for individual plans
     const quantity =
@@ -330,12 +389,33 @@ export const POST = async (req: NextRequest) => {
       await workos.userManagement.listOrganizationMemberships({
         userId,
         statuses: ["active"],
+        ...(organizationId && { organizationId }),
       });
 
     let organization;
 
+    if (organizationId && existingMemberships.data.length === 0) {
+      return json(
+        {
+          error: "Select an active organization before subscribing",
+          code: "organization_selection_required",
+        },
+        { status: 409 },
+      );
+    }
+
     if (existingMemberships.data && existingMemberships.data.length > 0) {
-      // User already has an organization, use the first one
+      // The authenticated active organization scopes multi-organization users.
+      // Without one, only a single unambiguous membership is safe to select.
+      if (!organizationId && existingMemberships.data.length > 1) {
+        return json(
+          {
+            error: "Select an active organization before subscribing",
+            code: "organization_selection_required",
+          },
+          { status: 409 },
+        );
+      }
       const membership = existingMemberships.data[0];
       if (!canManageOrganizationBilling(membership)) {
         return json(
@@ -361,18 +441,19 @@ export const POST = async (req: NextRequest) => {
     }
 
     // Retrieve price ID from Stripe
-    // The Stripe look up key for the price *must* be the same as the subscription level string
+    // The client selects only a logical plan. Stripe resolves that allowlisted
+    // lookup key; Pro Prices are checked against the displayed public amounts.
     let price;
 
     try {
       price = await stripe.prices.list({
-        lookup_keys: [subscriptionLevel],
+        lookup_keys: [resolvedPriceLookupKey],
       });
 
       // Check if price data exists and has at least one item
       if (!price.data || price.data.length === 0) {
         console.error(
-          `No price found for lookup key: ${subscriptionLevel}. This is likely because the products and prices have not been created yet. Run the setup script \`pnpm run setup\` to automatically create them.`,
+          `No price found for lookup key: ${resolvedPriceLookupKey}. This is likely because the products and prices have not been created yet.`,
         );
         return json(
           {
@@ -384,12 +465,56 @@ export const POST = async (req: NextRequest) => {
       }
     } catch (error) {
       console.error(
-        `Error retrieving price from Stripe for lookup key: ${subscriptionLevel}. This is likely because the products and prices have not been created yet. Run the setup script \`pnpm run setup\` to automatically create them.`,
+        `Error retrieving price from Stripe for lookup key: ${resolvedPriceLookupKey}.`,
         error,
       );
       return json(
         { error: "Error retrieving price from Stripe" },
         { status: 500 },
+      );
+    }
+
+    const selectedPrice = price.data.find(
+      (candidate) => candidate.lookup_key === resolvedPriceLookupKey,
+    );
+    if (!selectedPrice) {
+      return json({ error: "Subscription plan not found" }, { status: 404 });
+    }
+    if (
+      resolvedPriceLookupKey === PRO_MONTHLY_PRICE_LOOKUP_KEY &&
+      !isCurrentProMonthlyPrice(selectedPrice)
+    ) {
+      logger.error("Pro monthly Stripe Price is misconfigured", undefined, {
+        event: "billing.pro_monthly_price_invalid",
+        request_id: requestId,
+        service: "hackerai-web",
+        environment: getEnvironment(),
+        route: "/api/subscribe",
+        stripe_price_id: selectedPrice.id,
+        stripe_price_lookup_key: selectedPrice.lookup_key,
+      });
+      return json(
+        { error: "Pro monthly price is unavailable" },
+        { status: 503 },
+      );
+    }
+
+    if (
+      resolvedPriceLookupKey === PRO_YEARLY_PRICE_LOOKUP_KEY &&
+      !isCurrentProYearlyPrice(selectedPrice)
+    ) {
+      logger.error("Pro yearly Stripe Price is misconfigured", undefined, {
+        event: "billing.pro_yearly_price_invalid",
+        request_id: requestId,
+        service: "hackerai-web",
+        environment: getEnvironment(),
+        route: "/api/subscribe",
+        stripe_price_id: selectedPrice.id,
+        stripe_price_lookup_key: selectedPrice.lookup_key,
+      });
+      return json(
+        { error: "Pro yearly price is unavailable" },
+        { status: 503 },
       );
     }
 
@@ -475,7 +600,36 @@ export const POST = async (req: NextRequest) => {
       });
     }
 
-    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL;
+    // The old renewal can still be payable after an immediate cancellation.
+    // Do not take a second Checkout payment until its final state is known.
+    if (await hasRecentCanceledRenewalAtRisk(stripe, customer.id)) {
+      return json(
+        {
+          error:
+            "A recent subscription payment is still being resolved. Contact support before starting another subscription so you are not charged twice.",
+          code: "recent_renewal_payment_needs_review",
+        },
+        { status: 409 },
+      );
+    }
+
+    // Shared Preview configuration can point at another branch. Use Vercel's
+    // deployment identity so checkout returns to the branch that opened it.
+    const isVercelPreview =
+      process.env.VERCEL_ENV === "preview" && process.env.VERCEL === "1";
+    const trustedPreviewHosts = [
+      process.env.VERCEL_BRANCH_URL,
+      process.env.VERCEL_URL,
+    ];
+    const requestHost = req.nextUrl?.host;
+    const previewHost = isVercelPreview
+      ? requestHost && trustedPreviewHosts.includes(requestHost)
+        ? requestHost
+        : (process.env.VERCEL_BRANCH_URL ?? process.env.VERCEL_URL)
+      : undefined;
+    const baseUrl = previewHost
+      ? `https://${previewHost}`
+      : process.env.NEXT_PUBLIC_BASE_URL;
     if (!baseUrl) {
       return json(
         { error: "NEXT_PUBLIC_BASE_URL is not configured" },
@@ -498,11 +652,39 @@ export const POST = async (req: NextRequest) => {
 
     const cancelUrl = new URL(baseUrl);
 
+    if (freeQuotaSubject && subscription === "free") {
+      const attribution = await getConvexClient().query(
+        api.influencers.getAttribution,
+        {
+          serviceKey: process.env.CONVEX_SERVICE_ROLE_KEY!,
+          identity: freeQuotaSubject,
+        },
+      );
+      if (attribution) {
+        // Existing billing customers cannot acquire new influencer attribution.
+        const history = await stripe.subscriptions.list({
+          customer: customer.id,
+          status: "all",
+          limit: 1,
+        });
+        if (history.data.length === 0) {
+          await getConvexClient().mutation(api.influencers.bindCustomer, {
+            serviceKey: process.env.CONVEX_SERVICE_ROLE_KEY!,
+            identity: freeQuotaSubject,
+            customerId: customer.id,
+          });
+        }
+      }
+    }
+
     let session = await findReusableCheckoutSession({
       customerId: customer.id,
       organizationId: organization.id,
       requestedPlan: subscriptionLevel,
+      resolvedPriceLookupKey,
       quantity,
+      successUrl: successUrl.toString(),
+      cancelUrl: cancelUrl.toString(),
     });
     const reusedCheckoutSession = Boolean(session);
 
@@ -512,7 +694,7 @@ export const POST = async (req: NextRequest) => {
         billing_address_collection: "auto",
         line_items: [
           {
-            price: price.data[0].id,
+            price: selectedPrice.id,
             quantity: quantity,
           },
         ],
@@ -523,6 +705,7 @@ export const POST = async (req: NextRequest) => {
           userId,
           workOSOrganizationId: organization.id,
           requestedPlan: subscriptionLevel,
+          resolvedPriceLookupKey,
           checkoutQuantity: String(quantity),
           checkoutAttemptId,
           ...(checkoutSource && { checkoutSource }),
@@ -536,6 +719,7 @@ export const POST = async (req: NextRequest) => {
             userId,
             workOSOrganizationId: organization.id,
             requestedPlan: subscriptionLevel,
+            resolvedPriceLookupKey,
             checkoutQuantity: String(quantity),
             checkoutAttemptId,
             ...(checkoutSource && { checkoutSource }),
@@ -551,6 +735,7 @@ export const POST = async (req: NextRequest) => {
               "Renews monthly until cancelled. Cancel anytime in Settings.",
           },
         },
+        integration_identifier: "hackerai_pricing_kqtmxvra",
       });
     } else {
       const previousCheckoutAttemptId = session.metadata?.checkoutAttemptId;
@@ -560,6 +745,7 @@ export const POST = async (req: NextRequest) => {
           userId,
           workOSOrganizationId: organization.id,
           requestedPlan: subscriptionLevel,
+          resolvedPriceLookupKey,
           checkoutQuantity: String(quantity),
           checkoutAttemptId,
           ...(checkoutSource && { checkoutSource }),
@@ -634,7 +820,30 @@ export const POST = async (req: NextRequest) => {
       }
     }
 
-    const selectedPrice = price.data[0];
+    if (
+      freeQuotaSubject &&
+      subscription === "free" &&
+      partnerTrackingAllowed(req)
+    ) {
+      const checkoutStartedAt = Date.now();
+      after(async () => {
+        try {
+          const client = getConvexClient();
+          await client.mutation(api.influencerAnalytics.recordCheckout, {
+            serviceKey: process.env.CONVEX_SERVICE_ROLE_KEY!,
+            identity: freeQuotaSubject,
+            attemptId: session.id,
+            timestamp: checkoutStartedAt,
+            plan: resolvedPriceLookupKey,
+            interval: selectedPrice.recurring?.interval ?? "unknown",
+          });
+          await flushInfluencerAnalytics(client);
+        } catch {
+          console.warn("Influencer checkout analytics unavailable");
+        }
+      });
+    }
+
     phLogger.event(
       PAID_FUNNEL_EVENTS.checkoutStarted,
       paidFunnelProperties({
@@ -645,7 +854,9 @@ export const POST = async (req: NextRequest) => {
         checkout_type: "new_subscription",
         from_tier: fromTier,
         to_tier: planLookupKeyToTier(subscriptionLevel),
-        plan: subscriptionLevel,
+        plan: resolvedPriceLookupKey,
+        requested_plan: subscriptionLevel,
+        stripe_price_lookup_key: resolvedPriceLookupKey,
         billing_interval: selectedPrice.recurring?.interval,
         billing_interval_count: selectedPrice.recurring?.interval_count,
         quantity,
@@ -654,6 +865,10 @@ export const POST = async (req: NextRequest) => {
         reason: checkoutReason,
         limit_type: checkoutLimitType,
         checkout_amount_dollars:
+          selectedPrice.unit_amount != null
+            ? (selectedPrice.unit_amount * quantity) / 100
+            : undefined,
+        charged_amount_dollars:
           selectedPrice.unit_amount != null
             ? (selectedPrice.unit_amount * quantity) / 100
             : undefined,
@@ -671,7 +886,10 @@ export const POST = async (req: NextRequest) => {
     );
     after(() => phLogger.flush());
 
-    return json({ url: session.url, checkoutAttemptId });
+    return json({
+      url: session.url,
+      checkoutAttemptId,
+    });
   } catch (error: unknown) {
     if (error instanceof ChatSDKError) {
       return json(
