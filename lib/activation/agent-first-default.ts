@@ -1,5 +1,6 @@
 import type { ChatMode, SandboxPreference } from "@/types/chat";
 import type { SubscriptionTier } from "@/types";
+import { isDesktopPreference } from "@/lib/sandbox/environment";
 
 export type AgentFirstSandboxType =
   "desktop" | "remote-connection" | "e2b" | "none";
@@ -14,7 +15,6 @@ export type AgentFirstDefaultEligibility = {
   isMobile: boolean | undefined;
   subscription: SubscriptionTier;
   subscriptionResolved: boolean;
-  temporaryChatsEnabled: boolean;
   userPresent: boolean;
 };
 
@@ -74,7 +74,7 @@ export function normalizeAgentFirstSandboxType(
   preference: SandboxPreference | null,
 ): AgentFirstSandboxType {
   if (!preference) return "none";
-  if (preference === "desktop") return "desktop";
+  if (isDesktopPreference(preference)) return "desktop";
   if (preference === "e2b") return "e2b";
   return "remote-connection";
 }
@@ -89,14 +89,12 @@ export function getAgentFirstDefaultDecision({
   isMobile,
   subscription,
   subscriptionResolved,
-  temporaryChatsEnabled,
   userPresent,
 }: AgentFirstDefaultEligibility): AgentFirstDefaultDecision | null {
   const baseEligible =
     userPresent &&
     subscriptionResolved &&
     !isCheckingProPlan &&
-    !temporaryChatsEnabled &&
     chatMode === "ask" &&
     !hasSavedChatMode &&
     !hasUserSelectedModeThisSession;

@@ -78,13 +78,38 @@ const clearTerminalAgentRun = async ({
 export const createAgentStatusPost =
   ({ endpoint }: { endpoint: AgentApiEndpoint }) =>
   async (req: NextRequest) => {
+    let stage = "read_request";
     let userId: string | undefined;
     let chatId: string | undefined;
     let runId: string | undefined;
+    let ownedRun: { chatId: string; runId: string } | undefined;
     const requestId =
       req.headers.get("x-request-id") ??
       req.headers.get("x-vercel-id") ??
       undefined;
+    const requestStartedAt = Date.now();
+    // Vercel's 30s hard timeout can bypass catch/finally. Capture the pending
+    // stage beforehand, with a fixed two-warning budget for the whole request.
+    const slowRequestTimers = [10_000, 20_000].map((delay) =>
+      setTimeout(() => {
+        console.warn(
+          JSON.stringify({
+            timestamp: new Date().toISOString(),
+            level: "warn",
+            event: "agent_status_slow_request",
+            service: "hackerai-web",
+            environment:
+              process.env.VERCEL_ENV ?? process.env.NODE_ENV ?? "unknown",
+            endpoint,
+            user_id: userId,
+            chat_id: ownedRun?.chatId,
+            trigger_run_id: ownedRun?.runId,
+            stage,
+            elapsed_ms: Date.now() - requestStartedAt,
+          }),
+        );
+      }, delay),
+    );
 
     try {
       let body: AgentStatusRequestBody;
@@ -104,22 +129,47 @@ export const createAgentStatusPost =
         return new NextResponse("runId required", { status: 400 });
       }
 
+      stage = "authenticate";
       const authContext = await getUserIDAndPro(req);
       userId = authContext.userId;
 
+      stage = "get_chat";
+      const chat = await getChatById({ id: chatId });
+      if (!chat) {
+        return new NextResponse("Chat not found", { status: 404 });
+      }
+      if (chat.user_id !== userId) {
+        return new NextResponse("Forbidden", { status: 403 });
+      }
+
+      // The Agent task clears this association as soon as its user-visible
+      // answer is persisted, before post-run cleanup finishes in Trigger.dev.
+      // Treat that detached state as UI-terminal so the browser does not keep
+      // showing Stop while only backend cleanup remains.
+      if (chat.active_trigger_run_id !== runId) {
+        return NextResponse.json({ status: "DETACHED", terminal: true });
+      }
+
+      ownedRun = { chatId: chat.id, runId: chat.active_trigger_run_id };
+      stage = "retrieve_trigger_run";
       const run = (await runs.retrieve(runId)) as TriggerRunStatus;
       if (!runBelongsToChatOwner(run, { chatId, userId })) {
         return new NextResponse("Forbidden", { status: 403 });
       }
 
-      if (run.status && TERMINAL_RUN_STATUSES.has(run.status)) {
+      const terminal = Boolean(
+        run.status && TERMINAL_RUN_STATUSES.has(run.status),
+      );
+      if (terminal) {
+        stage = "clear_terminal_trigger_run";
         await clearTerminalAgentRun({ chatId, userId, runId });
       }
 
-      return NextResponse.json({ status: run.status });
+      return NextResponse.json({ status: run.status, terminal });
     } catch (error) {
       if (isMissingTriggerRunError(error)) {
         if (chatId && userId && runId) {
+          stage = "clear_missing_trigger_run";
           await clearTerminalAgentRun({ chatId, userId, runId }).catch(
             () => undefined,
           );
@@ -137,7 +187,10 @@ export const createAgentStatusPost =
           userId,
           chatId,
           runId,
+          stage,
         },
       });
+    } finally {
+      slowRequestTimers.forEach(clearTimeout);
     }
   };

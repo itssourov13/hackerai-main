@@ -1,5 +1,9 @@
 import type { AnySandbox } from "@/types";
-import { isCentrifugoSandbox, isE2BSandbox } from "./sandbox-types";
+import {
+  isCentrifugoSandbox,
+  isE2BSandbox,
+  isMiosaSandbox,
+} from "./sandbox-types";
 
 export const MAX_COMMAND_EXECUTION_TIME = 10 * 60 * 1000; // 10 minutes
 
@@ -55,6 +59,7 @@ export function buildSandboxCommandOptions(
   user?: "root";
   cwd?: string;
   envVars?: Record<string, string>;
+  envs?: Record<string, string>;
   onStdout?: (data: string) => void;
   onStderr?: (data: string) => void;
 } {
@@ -66,7 +71,13 @@ export function buildSandboxCommandOptions(
       user: "root" as const,
       cwd: "/home/user",
     }),
-    ...(extraEnvVars && { envVars: extraEnvVars }),
+    ...(isMiosaSandbox(sandbox) && { cwd: "/home/user" }),
+    // E2B ignores envVars: its CommandStartOpts uses envs. The owned local
+    // and MIOSA adapters use envVars instead.
+    ...(extraEnvVars &&
+      (isE2BSandbox(sandbox)
+        ? { envs: extraEnvVars }
+        : { envVars: extraEnvVars })),
     ...(handlers && {
       onStdout: handlers.onStdout,
       onStderr: handlers.onStderr,

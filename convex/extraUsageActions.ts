@@ -7,6 +7,7 @@ import Stripe from "stripe";
 import { WorkOS } from "@workos-inc/node";
 import { convexLogger } from "./lib/logger";
 import { extraUsageDollarsToPoints } from "./lib/extraUsagePricing";
+import { BILLING_ERRORS } from "../lib/billing/billing-errors";
 
 // =============================================================================
 // SDK Initialization (lazy, cached)
@@ -56,6 +57,41 @@ function canManageOrganizationBilling(membership: BillingMembership): boolean {
     roles?.some((role) => role?.slug === "admin" || role?.slug === "owner");
 
   return (status === undefined || status === "active") && !!hasBillingRole;
+}
+
+const DEFAULT_APPLICATION_ORIGINS = new Set(["https://hackerai.co"]);
+
+/** Restrict Stripe return URLs to exact server-configured application origins. */
+function isAllowedApplicationOrigin(url: URL): boolean {
+  const hostname = url.hostname.toLowerCase();
+  const isLocalhost =
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "[::1]";
+
+  if (isLocalhost) {
+    return url.protocol === "http:" || url.protocol === "https:";
+  }
+
+  if (url.protocol !== "https:") {
+    return false;
+  }
+
+  const allowedOrigins = new Set(DEFAULT_APPLICATION_ORIGINS);
+  for (const configuredOrigin of (
+    process.env.EXTRA_USAGE_CHECKOUT_ALLOWED_ORIGINS ?? ""
+  ).split(",")) {
+    const value = configuredOrigin.trim();
+    if (!value) continue;
+
+    try {
+      allowedOrigins.add(new URL(value).origin);
+    } catch {
+      // Ignore malformed server configuration rather than trusting it.
+    }
+  }
+
+  return allowedOrigins.has(url.origin);
 }
 
 async function getStripeCustomerId(userId: string): Promise<string | null> {
@@ -499,6 +535,9 @@ export const createPurchaseSession = action({
     amountDollars: v.number(),
     baseUrl: v.string(),
     checkoutAttemptId: v.optional(v.string()),
+    returnPath: v.optional(v.string()),
+    resumeAfterPurchase: v.optional(v.boolean()),
+    enableExtraUsageAfterPurchase: v.optional(v.boolean()),
   },
   returns: v.object({
     url: v.union(v.string(), v.null()),
@@ -509,6 +548,17 @@ export const createPurchaseSession = action({
     const identity = await ctx.auth.getUserIdentity();
     if (!identity) {
       return { url: null, error: "Not authenticated" };
+    }
+
+    const activeSuspension = await ctx.runQuery(
+      api.userSuspensions.getActiveByUser,
+      {
+        serviceKey: process.env.CONVEX_SERVICE_ROLE_KEY!,
+        userId: identity.subject,
+      },
+    );
+    if (activeSuspension?.status === "active") {
+      return { url: null, error: BILLING_ERRORS.accountSuspended };
     }
 
     // Validate amount
@@ -522,9 +572,29 @@ export const createPurchaseSession = action({
       return { url: null, error: "Maximum amount is $999,999" };
     }
 
-    // Basic URL validation
-    if (!args.baseUrl || !args.baseUrl.startsWith("http")) {
+    let applicationOrigin: string;
+    try {
+      const applicationUrl = new URL(args.baseUrl);
+      if (!isAllowedApplicationOrigin(applicationUrl)) {
+        return { url: null, error: "Invalid base URL" };
+      }
+      applicationOrigin = applicationUrl.origin;
+    } catch {
       return { url: null, error: "Invalid base URL" };
+    }
+
+    let returnUrl: URL | undefined;
+    if (
+      args.returnPath !== undefined &&
+      (!args.returnPath.startsWith("/") || args.returnPath.length > 400)
+    ) {
+      return { url: null, error: "Invalid return path" };
+    }
+    if (args.returnPath) {
+      returnUrl = new URL(args.returnPath, applicationOrigin);
+      if (returnUrl.origin !== applicationOrigin) {
+        return { url: null, error: "Invalid return path" };
+      }
     }
 
     try {
@@ -569,9 +639,14 @@ export const createPurchaseSession = action({
           ...(args.checkoutAttemptId && {
             checkoutAttemptId: args.checkoutAttemptId,
           }),
+          ...(args.returnPath && { returnPath: args.returnPath }),
+          ...(args.resumeAfterPurchase && { resumeAfterPurchase: "true" }),
+          ...(args.enableExtraUsageAfterPurchase && {
+            enableExtraUsageAfterPurchase: "true",
+          }),
         },
-        success_url: `${args.baseUrl}/api/extra-usage/confirm?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: args.baseUrl,
+        success_url: `${applicationOrigin}/api/extra-usage/confirm?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: returnUrl?.toString() ?? applicationOrigin,
       });
 
       try {
@@ -633,6 +708,17 @@ export const createBillingPortalSession = action({
     const identity = await ctx.auth.getUserIdentity();
     if (!identity) {
       return { url: null, error: "Not authenticated" };
+    }
+
+    const activeSuspension = await ctx.runQuery(
+      api.userSuspensions.getActiveByUser,
+      {
+        serviceKey: process.env.CONVEX_SERVICE_ROLE_KEY!,
+        userId: identity.subject,
+      },
+    );
+    if (activeSuspension?.status === "active") {
+      return { url: null, error: BILLING_ERRORS.accountSuspended };
     }
 
     // Basic URL validation
@@ -716,6 +802,27 @@ export const deductWithAutoReload = action({
     // Validate service key
     if (args.serviceKey !== process.env.CONVEX_SERVICE_ROLE_KEY) {
       throw new Error("Invalid service key");
+    }
+
+    const activeSuspension = await ctx.runQuery(
+      api.userSuspensions.getActiveByUser,
+      {
+        serviceKey: args.serviceKey,
+        userId: args.userId,
+      },
+    );
+    if (activeSuspension?.status === "active") {
+      return {
+        success: false,
+        newBalanceDollars: 0,
+        insufficientFunds: true,
+        monthlyCapExceeded: false,
+        autoReloadTriggered: false,
+        autoReloadResult: {
+          success: false,
+          reason: "account_suspended",
+        },
+      };
     }
 
     if (args.amountPoints <= 0) {

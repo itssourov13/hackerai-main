@@ -1,6 +1,11 @@
 import { describe, expect, it, jest, beforeEach } from "@jest/globals";
 
 const mockRedirectToBillingPortal = jest.fn();
+const mockOpenRenewalInvoice = jest.fn();
+jest.mock("@/lib/actions/renewal-invoice", () => ({
+  __esModule: true,
+  default: mockOpenRenewalInvoice,
+}));
 const mockGetSubscriptionCancellationStatus = jest.fn();
 const mockKeepSubscription = jest.fn();
 const mockCancelSubscription = jest.fn();
@@ -53,13 +58,60 @@ describe("billing API routes", () => {
     jest.clearAllMocks();
   });
 
+  it("returns the server-selected invoice payment page", async () => {
+    mockOpenRenewalInvoice.mockResolvedValue(
+      "https://invoice.stripe.com/i/current" as never,
+    );
+    const { POST } = await import("../renewal-invoice/route");
+    const response = await POST();
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      url: "https://invoice.stripe.com/i/current",
+    });
+  });
+
+  it.each([
+    ["Only admins or owners can manage billing", 403],
+    ["User not authenticated", 401],
+    ["No payable renewal invoice found. Check your billing status.", 409],
+  ])(
+    "preserves invoice authorization and eligibility errors",
+    async (message, status) => {
+      mockOpenRenewalInvoice.mockRejectedValue(new Error(message) as never);
+      const { POST } = await import("../renewal-invoice/route");
+      expect((await POST()).status).toBe(status);
+    },
+  );
+
+  it("accepts pricing as an authorized portal recovery surface", async () => {
+    mockRedirectToBillingPortal.mockResolvedValue(
+      "https://billing.stripe.com/session" as never,
+    );
+    const { POST } = await import("../portal/route");
+    expect(
+      (
+        await POST(
+          request({
+            flow: "payment_method",
+            surface: "pricing_dialog",
+            returnPath: "/c/test",
+          }) as never,
+        )
+      ).status,
+    ).toBe(200);
+    expect(mockRedirectToBillingPortal).toHaveBeenCalledWith("payment_method", {
+      surface: "pricing_dialog",
+      returnPath: "/c/test",
+    });
+  });
+
   it("returns a billing portal URL", async () => {
     mockRedirectToBillingPortal.mockResolvedValue(
       "https://billing.stripe.com/session" as never,
     );
     const { POST } = await import("../portal/route");
 
-    const response = await POST();
+    const response = await POST(request(null) as never);
 
     await expect(response.json()).resolves.toEqual({
       url: "https://billing.stripe.com/session",
@@ -73,12 +125,39 @@ describe("billing API routes", () => {
     );
     const { POST } = await import("../portal/route");
 
-    const response = await POST();
+    const response = await POST(request(null) as never);
 
     expect(response.status).toBe(403);
     await expect(response.json()).resolves.toEqual({
       error: "Only admins or owners can manage billing",
     });
+  });
+
+  it("passes payment method update mode to the billing portal action", async () => {
+    mockRedirectToBillingPortal.mockResolvedValue(
+      "https://billing.stripe.com/payment-method" as never,
+    );
+    const { POST } = await import("../portal/route");
+
+    const response = await POST(request({ flow: "payment_method" }) as never);
+
+    expect(response.status).toBe(200);
+    expect(mockRedirectToBillingPortal).toHaveBeenCalledWith(
+      "payment_method",
+      {},
+    );
+  });
+
+  it("rejects unsupported billing portal flows", async () => {
+    const { POST } = await import("../portal/route");
+
+    const response = await POST(request({ flow: "cancel" }) as never);
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "Invalid billing portal flow",
+    });
+    expect(mockRedirectToBillingPortal).not.toHaveBeenCalled();
   });
 
   it("returns subscription cancellation status", async () => {
@@ -129,6 +208,7 @@ describe("billing API routes", () => {
       request({
         cancellationReason: {
           reasonCategory: "too_expensive",
+          reasonSubcategory: "too_expensive_low_frequency",
           reasonDetails: "Budget changed",
         },
       }) as never,
@@ -138,6 +218,7 @@ describe("billing API routes", () => {
     expect(mockCancelSubscription).toHaveBeenCalledWith({
       cancellationReason: {
         reasonCategory: "too_expensive",
+        reasonSubcategory: "too_expensive_low_frequency",
         reasonDetails: "Budget changed",
       },
     });
@@ -168,5 +249,41 @@ describe("billing API routes", () => {
       error: "Please select the main cancellation reason",
     });
     expect(mockCancelSubscription).not.toHaveBeenCalled();
+  });
+});
+
+describe("billing portal recovery options", () => {
+  beforeEach(() => jest.clearAllMocks());
+  it("forwards a blocked-chat return path", async () => {
+    mockRedirectToBillingPortal.mockResolvedValue(
+      "https://billing.stripe.com/test" as never,
+    );
+    const { POST } = await import("../portal/route");
+    expect(
+      (
+        await POST(
+          request({
+            flow: "payment_method",
+            surface: "blocked_chat",
+            returnPath: "/c/test",
+          }) as never,
+        )
+      ).status,
+    ).toBe(200);
+    expect(mockRedirectToBillingPortal).toHaveBeenCalledWith("payment_method", {
+      surface: "blocked_chat",
+      returnPath: "/c/test",
+    });
+  });
+  it.each([
+    { surface: "arbitrary" },
+    { returnPath: "https://evil.example" },
+    { returnPath: "//evil.example" },
+    { returnPath: 123 },
+    { returnPath: "/" + "a".repeat(401) },
+  ])("rejects invalid options %j", async (body) => {
+    const { POST } = await import("../portal/route");
+    expect((await POST(request(body) as never)).status).toBe(400);
+    expect(mockRedirectToBillingPortal).not.toHaveBeenCalled();
   });
 });

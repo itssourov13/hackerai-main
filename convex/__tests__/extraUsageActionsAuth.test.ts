@@ -125,15 +125,20 @@ function makeCtx(userId = "user_member") {
     auth: {
       getUserIdentity: jest.fn(async () => ({ subject: userId })),
     },
+    runQuery: jest.fn(async () => null),
     runMutation: jest.fn(async () => null),
   };
 }
 
-async function callCreatePurchaseSession(ctx: any) {
+async function callCreatePurchaseSession(
+  ctx: any,
+  overrides: Record<string, unknown> = {},
+) {
   const { createPurchaseSession } = await import("../extraUsageActions");
   return (createPurchaseSession as any).handler(ctx, {
     amountDollars: 15,
-    baseUrl: "https://hackerai.example/settings",
+    baseUrl: "https://hackerai.co/settings",
+    ...overrides,
   });
 }
 
@@ -212,6 +217,24 @@ describe("extraUsageActions billing authorization", () => {
     } as never);
   });
 
+  it("blocks Checkout creation while the account has an active dispute hold", async () => {
+    const ctx = makeCtx("user_suspended");
+    ctx.runQuery.mockResolvedValueOnce({
+      status: "active",
+      category: "dispute_billing_hold",
+    });
+
+    const result = await callCreatePurchaseSession(ctx);
+
+    expect(result).toEqual({
+      url: null,
+      error:
+        "Billing is disabled while this account has an active payment dispute or fraud hold. Contact support before making another payment.",
+    });
+    expect(mockListOrganizationMemberships).not.toHaveBeenCalled();
+    expect(mockCheckoutSessionCreate).not.toHaveBeenCalled();
+  });
+
   it("rejects a non-admin active org member before creating a Checkout session", async () => {
     mockListOrganizationMemberships.mockResolvedValue({
       data: [
@@ -235,6 +258,36 @@ describe("extraUsageActions billing authorization", () => {
       url: null,
       error: "No Stripe customer found. Please subscribe first.",
     });
+  });
+
+  it("rejects a return path that resolves outside the application origin", async () => {
+    const result = await callCreatePurchaseSession(makeCtx(), {
+      baseUrl: "https://hackerai.co",
+      returnPath: "/\\evil.example",
+    });
+
+    expect(result).toEqual({ url: null, error: "Invalid return path" });
+    expect(mockCheckoutSessionCreate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a caller-controlled external application origin", async () => {
+    const result = await callCreatePurchaseSession(makeCtx(), {
+      baseUrl: "https://evil.example",
+    });
+
+    expect(result).toEqual({ url: null, error: "Invalid base URL" });
+    expect(mockListOrganizationMemberships).not.toHaveBeenCalled();
+    expect(mockCheckoutSessionCreate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a similarly named Vercel project outside the exact allowlist", async () => {
+    const result = await callCreatePurchaseSession(makeCtx(), {
+      baseUrl: "https://attacker-hackerai.vercel.app",
+    });
+
+    expect(result).toEqual({ url: null, error: "Invalid base URL" });
+    expect(mockListOrganizationMemberships).not.toHaveBeenCalled();
+    expect(mockCheckoutSessionCreate).not.toHaveBeenCalled();
   });
 
   it("rejects a non-admin active org member before creating a Billing Portal session", async () => {
@@ -312,6 +365,38 @@ describe("extraUsageActions billing authorization", () => {
     });
   });
 
+  it("returns a resumable direct-purchase Checkout session to the stopped task", async () => {
+    mockListOrganizationMemberships.mockResolvedValue({
+      data: [
+        {
+          organizationId: "org_team",
+          status: "active",
+          role: { slug: "admin" },
+        },
+      ],
+    } as never);
+
+    await callCreatePurchaseSession(makeCtx("user_admin"), {
+      baseUrl: "https://hackerai.co",
+      returnPath: "/chat-123?view=task",
+      resumeAfterPurchase: true,
+      enableExtraUsageAfterPurchase: true,
+    });
+
+    expect(mockCheckoutSessionCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        success_url:
+          "https://hackerai.co/api/extra-usage/confirm?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url: "https://hackerai.co/chat-123?view=task",
+        metadata: expect.objectContaining({
+          returnPath: "/chat-123?view=task",
+          resumeAfterPurchase: "true",
+          enableExtraUsageAfterPurchase: "true",
+        }),
+      }),
+    );
+  });
+
   it("still returns the Checkout session when purchase recording fails", async () => {
     mockListOrganizationMemberships.mockResolvedValue({
       data: [
@@ -372,6 +457,30 @@ describe("deductWithAutoReload", () => {
       id: "in_auto",
       deleted: true,
     } as never);
+  });
+
+  it("does not charge auto-reload while the account is suspended", async () => {
+    const ctx: any = {
+      runQuery: jest.fn(async () => ({
+        status: "active",
+        category: "dispute_billing_hold",
+      })),
+      runMutation: jest.fn(),
+    };
+
+    const result = await callDeductWithAutoReload(ctx, {
+      userId: "user_suspended",
+      amountPoints: 100_000,
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      autoReloadTriggered: false,
+      autoReloadResult: { success: false, reason: "account_suspended" },
+    });
+    expect(ctx.runMutation).not.toHaveBeenCalled();
+    expect(mockInvoicesCreate).not.toHaveBeenCalled();
+    expect(mockInvoicesPay).not.toHaveBeenCalled();
   });
 
   it("attempts auto-reload when the request is larger than the current balance", async () => {

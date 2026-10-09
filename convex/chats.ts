@@ -1,3 +1,5 @@
+import { scheduleFileDeletion } from "./lib/fileDeletion";
+import { deleteModelHistory } from "./modelHistory";
 import { query, mutation, internalMutation } from "./_generated/server";
 import type { MutationCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
@@ -26,9 +28,11 @@ import {
   assertUserCanAccessChatHistory,
 } from "./lib/suspensionGuards";
 import { resolveBranchedFromTitle } from "./lib/branchedChatTitle";
+import { isUserDeletionFenced } from "./lib/userDeletionFence";
 
 const DELETE_ALL_CHATS_MESSAGE_BATCH_SIZE = 10;
 const DELETE_ALL_CHATS_SUMMARY_BATCH_SIZE = 25;
+const DELETE_CHAT_SUBAGENT_BATCH_SIZE = 10;
 const CHAT_DELETION_FENCE_BATCH_SIZE = 100;
 const MAX_ACTIVE_TRIGGER_RUNS_TO_RETURN = 100;
 const CHAT_SUMMARY_TELEMETRY_CLEANUP_DEFAULT_BATCH_SIZE = 500;
@@ -45,6 +49,9 @@ const CHAT_SUMMARY_TELEMETRY_FIELDS = [
 const activeAgentApprovalRequestValidator = v.object({
   approvalId: v.string(),
   toolCallId: v.string(),
+  sourceRunId: v.optional(v.string()),
+  sourceAgentId: v.optional(v.string()),
+  sourceAgentName: v.optional(v.string()),
   operation: v.optional(
     v.union(
       v.literal("terminal_execute"),
@@ -61,6 +68,36 @@ const activeAgentApprovalRequestValidator = v.object({
   detail: v.optional(v.string()),
   kind: v.optional(v.union(v.literal("terminal"), v.literal("file"))),
   createdAt: v.optional(v.number()),
+  autoReview: v.optional(
+    v.object({
+      verdict: v.union(
+        v.literal("approve"),
+        v.literal("ask_user"),
+        v.literal("deny"),
+      ),
+      riskCategory: v.union(
+        v.literal("routine"),
+        v.literal("destructive"),
+        v.literal("credential_access"),
+        v.literal("data_egress"),
+        v.literal("security_weakening"),
+        v.literal("scope_expansion"),
+        v.literal("prompt_injection"),
+        v.literal("unknown"),
+      ),
+      rationale: v.string(),
+      rolloutPhase: v.union(v.literal("shadow"), v.literal("enforce")),
+      failureClass: v.optional(
+        v.union(
+          v.literal("timeout"),
+          v.literal("provider_error"),
+          v.literal("parse_error"),
+          v.literal("missing_context"),
+          v.literal("context_truncated"),
+        ),
+      ),
+    }),
+  ),
 });
 
 const agentApprovalTargetGrantValidator = v.union(
@@ -186,6 +223,7 @@ async function publishDeletionCancellation(ctx: MutationCtx, chatId: string) {
 }
 
 async function prepareChatForDeletion(ctx: MutationCtx, chat: Doc<"chats">) {
+  await deleteModelHistory(ctx, chat.id);
   if (
     chat.active_stream_id === undefined &&
     chat.active_trigger_run_id === undefined &&
@@ -216,37 +254,80 @@ async function deleteMessageForChatDeletion(
   ctx: MutationCtx,
   message: Doc<"messages">,
 ) {
-  // Skip deleting files for copied messages (they reference original chat files)
+  // Copied messages reference the original task's files.
   if (!message.source_message_id && message.file_ids?.length) {
     for (const fileId of message.file_ids) {
-      try {
-        const file = await ctx.db.get(fileId);
-        if (file) {
-          if (file.s3_key) {
-            await ctx.scheduler.runAfter(
-              0,
-              internal.s3Cleanup.deleteS3ObjectAction,
-              { s3Key: file.s3_key },
-            );
-          }
-          await fileCountAggregate.deleteIfExists(ctx, file);
-          await ctx.db.delete(file._id);
-        }
-      } catch (error) {
-        console.error(`Failed to delete file ${fileId}:`, error);
+      const file = await ctx.db.get(fileId);
+      if (file) {
+        await scheduleFileDeletion(ctx, file, message.chat_id);
+        await fileCountAggregate.deleteIfExists(ctx, file);
+        await ctx.db.delete(file._id);
       }
     }
   }
-
-  if (message.feedback_id) {
-    try {
-      await ctx.db.delete(message.feedback_id);
-    } catch (error) {
-      console.error(`Failed to delete feedback ${message.feedback_id}:`, error);
-    }
+  if (message.feedback_id && (await ctx.db.get(message.feedback_id))) {
+    await ctx.db.delete(message.feedback_id);
   }
 
   await ctx.db.delete(message._id);
+}
+
+async function deleteSubagentDataForChat(
+  ctx: MutationCtx,
+  chatId: string,
+): Promise<boolean> {
+  const children = await ctx.db
+    .query("subagent_runs")
+    .withIndex("by_chat_id", (q) => q.eq("chat_id", chatId))
+    .take(DELETE_CHAT_SUBAGENT_BATCH_SIZE + 1);
+
+  for (const child of children.slice(0, DELETE_CHAT_SUBAGENT_BATCH_SIZE)) {
+    if (
+      child.status === "queued" ||
+      child.status === "running" ||
+      child.status === "finalizing"
+    ) {
+      return true;
+    }
+    const transcript = await ctx.db
+      .query("subagent_messages")
+      .withIndex("by_subagent_and_sequence", (q) =>
+        q.eq("subagent_id", child.subagent_id),
+      )
+      .take(DELETE_CHAT_SUBAGENT_BATCH_SIZE + 1);
+    for (const message of transcript.slice(
+      0,
+      DELETE_CHAT_SUBAGENT_BATCH_SIZE,
+    )) {
+      await ctx.db.delete(message._id);
+    }
+    if (transcript.length > DELETE_CHAT_SUBAGENT_BATCH_SIZE) return true;
+
+    const events = await ctx.db
+      .query("subagent_events")
+      .withIndex("by_subagent", (q) => q.eq("subagent_id", child.subagent_id))
+      .take(DELETE_CHAT_SUBAGENT_BATCH_SIZE + 1);
+    for (const event of events.slice(0, DELETE_CHAT_SUBAGENT_BATCH_SIZE)) {
+      await ctx.db.delete(event._id);
+    }
+    if (events.length > DELETE_CHAT_SUBAGENT_BATCH_SIZE) return true;
+
+    const workItems = await ctx.db
+      .query("subagent_work_items")
+      .withIndex("by_subagent", (q) => q.eq("subagent_id", child.subagent_id))
+      .take(DELETE_CHAT_SUBAGENT_BATCH_SIZE + 1);
+    for (const workItem of workItems.slice(
+      0,
+      DELETE_CHAT_SUBAGENT_BATCH_SIZE,
+    )) {
+      await ctx.db.delete(workItem._id);
+    }
+    if (workItems.length > DELETE_CHAT_SUBAGENT_BATCH_SIZE) return true;
+
+    await ctx.db.delete(child._id);
+  }
+  if (children.length > DELETE_CHAT_SUBAGENT_BATCH_SIZE) return true;
+  return false;
 }
 
 async function deleteChatDocument(ctx: MutationCtx, chat: Doc<"chats">) {
@@ -271,14 +352,14 @@ async function deleteChatDocument(ctx: MutationCtx, chat: Doc<"chats">) {
     }
   }
 
+  if (await deleteSubagentDataForChat(ctx, chat.id)) {
+    await scheduleDeleteChatDocumentBatch(ctx, chat.id, chat.user_id);
+    return;
+  }
+
   if (chat.latest_summary_id) {
-    try {
+    if (await ctx.db.get(chat.latest_summary_id)) {
       await ctx.db.delete(chat.latest_summary_id);
-    } catch (error) {
-      console.error(
-        `Failed to delete summary ${chat.latest_summary_id}:`,
-        error,
-      );
     }
     await ctx.db.patch(chat._id, { latest_summary_id: undefined });
   }
@@ -293,12 +374,7 @@ async function deleteChatDocument(ctx: MutationCtx, chat: Doc<"chats">) {
     0,
     DELETE_ALL_CHATS_SUMMARY_BATCH_SIZE,
   )) {
-    try {
-      await ctx.db.delete(summary._id);
-    } catch (error) {
-      console.error(`Failed to delete summary ${summary._id}:`, error);
-      // Continue with deletion even if summary cleanup fails
-    }
+    await ctx.db.delete(summary._id);
   }
 
   if (summaries.length > DELETE_ALL_CHATS_SUMMARY_BATCH_SIZE) {
@@ -343,13 +419,14 @@ async function deleteNextUserChatBatch(ctx: MutationCtx, userId: string) {
 
   if (summaries.length > 0) {
     for (const summary of summaries) {
-      try {
-        await ctx.db.delete(summary._id);
-      } catch (error) {
-        console.error(`Failed to delete summary ${summary._id}:`, error);
-      }
+      await ctx.db.delete(summary._id);
     }
 
+    await scheduleDeleteAllChatsBatch(ctx, userId);
+    return true;
+  }
+
+  if (await deleteSubagentDataForChat(ctx, chat.id)) {
     await scheduleDeleteAllChatsBatch(ctx, userId);
     return true;
   }
@@ -372,6 +449,7 @@ export const getChatByIdFromClient = query({
       title: v.string(),
       user_id: v.string(),
       finish_reason: v.optional(v.string()),
+      last_run_finished_at: v.optional(v.number()),
       active_stream_id: v.optional(v.string()),
       canceled_at: v.optional(v.number()),
       deletion_started_at: v.optional(v.number()),
@@ -439,6 +517,7 @@ export const getChatByIdFromClient = query({
       const {
         codex_thread_id: _legacy,
         agent_approval_grants: _privateApprovalGrants,
+        objective_checkpoint: _privateObjectiveCheckpoint,
         ...chatPublic
       } = chat;
 
@@ -464,7 +543,7 @@ export const getChatByIdFromClient = query({
       return chatPublic;
     } catch (error) {
       console.error("Failed to get chat by id:", error);
-      return null;
+      throw error;
     }
   },
 });
@@ -483,6 +562,7 @@ export const getChatById = query({
       title: v.string(),
       user_id: v.string(),
       finish_reason: v.optional(v.string()),
+      last_run_finished_at: v.optional(v.number()),
       active_stream_id: v.optional(v.string()),
       canceled_at: v.optional(v.number()),
       deletion_started_at: v.optional(v.number()),
@@ -540,7 +620,11 @@ export const getChatById = query({
 
       // Drop legacy codex_thread_id from the response — preserved on the row
       // for old data but not exposed to callers.
-      const { codex_thread_id: _legacy, ...chatPublic } = chat;
+      const {
+        codex_thread_id: _legacy,
+        objective_checkpoint: _privateObjectiveCheckpoint,
+        ...chatPublic
+      } = chat;
       return chatPublic;
     } catch (error) {
       console.error("Failed to get chat by id (backend):", error);
@@ -567,6 +651,15 @@ export const saveChat = mutation({
     let failureStage = "start";
 
     try {
+      failureStage = "check_user_deletion_fence";
+      if (await isUserDeletionFenced(ctx.db, args.userId)) {
+        throw new ConvexError({
+          code: "ACCOUNT_DELETION_IN_PROGRESS",
+          message: "Account deletion is in progress",
+          operation: "chats.saveChat",
+        });
+      }
+
       failureStage = "find_existing_chat";
       const existingChat = await ctx.db
         .query("chats")
@@ -633,6 +726,7 @@ export const saveChat = mutation({
       const causeData = getConvexErrorData(error);
       if (
         getConvexErrorCode(causeData) === "CHAT_UNAUTHORIZED" ||
+        getConvexErrorCode(causeData) === "ACCOUNT_DELETION_IN_PROGRESS" ||
         getConvexErrorCode(causeData) === "PROJECT_NOT_FOUND" ||
         getConvexErrorCode(causeData) === "PROJECT_ACCESS_DENIED"
       ) {
@@ -675,8 +769,8 @@ export const saveChat = mutation({
  * toggles them in the UI, before sending. Client-callable, ownership-checked.
  *
  * Intentionally does NOT bump `update_time` (would reorder the sidebar) or
- * touch stream state — those side effects belong to `updateChat`, which only
- * the backend should call at end-of-stream.
+ * touch stream state. A visible user-message insert records new activity in
+ * `messages.saveMessage`; end-of-stream chat fields are handled by `updateChat`.
  */
 export const updateChatPreferences = mutation({
   args: {
@@ -780,7 +874,8 @@ export const updateChatTitle = mutation({
 
 /**
  * Update an existing chat with title and finish reason
- * Automatically clears active_stream_id and canceled_at for stream cleanup
+ * Automatically clears active_stream_id and canceled_at for stream cleanup.
+ * If a stream was active, records its finish time in the same write.
  */
 export const updateChat = mutation({
   args: {
@@ -835,6 +930,7 @@ export const updateChat = mutation({
       const updateData: {
         title?: string;
         finish_reason?: string;
+        last_run_finished_at?: number;
         default_model_slug?: "ask" | "agent" | "agent-long";
         todos?: Array<{
           id: string;
@@ -852,6 +948,10 @@ export const updateChat = mutation({
         active_stream_id: undefined,
         canceled_at: undefined,
       };
+
+      if (chat.active_stream_id !== undefined) {
+        updateData.last_run_finished_at = Date.now();
+      }
 
       if (args.title !== undefined) {
         updateData.title = args.title;
@@ -995,22 +1095,24 @@ export const getUserChats = query({
       );
 
       // Step 4: Enhance chats using the map
-      const enhancedChats = combinedPage.map((chat) => {
-        if (chat.branched_from_chat_id) {
-          const branchedFromChat = branchedChatMap.get(
-            chat.branched_from_chat_id,
-          );
-          return {
-            ...chat,
-            branched_from_title: resolveBranchedFromTitle(
-              chat,
-              branchedFromChat,
-              identity.subject,
-            ),
-          };
-        }
-        return chat;
-      });
+      const enhancedChats = combinedPage.map(
+        ({ objective_checkpoint: _privateObjectiveCheckpoint, ...chat }) => {
+          if (chat.branched_from_chat_id) {
+            const branchedFromChat = branchedChatMap.get(
+              chat.branched_from_chat_id,
+            );
+            return {
+              ...chat,
+              branched_from_title: resolveBranchedFromTitle(
+                chat,
+                branchedFromChat,
+                identity.subject,
+              ),
+            };
+          }
+          return chat;
+        },
+      );
 
       return {
         ...result,
@@ -1026,7 +1128,8 @@ export const getUserChats = query({
             ? { name: error.name, message: error.message }
             : String(error),
       });
-      return emptyChatsPage();
+      // A failed query is not an empty account. Let the client offer recovery.
+      throw error;
     }
   },
 });
@@ -1076,7 +1179,8 @@ export const pinChat = mutation({
 });
 
 /**
- * Unpin a chat. It will appear at the top of the unpinned list (update_time is set to now).
+ * Unpin a chat without changing its activity time, so it returns to its
+ * chronological position in the unpinned list.
  */
 export const unpinChat = mutation({
   args: {
@@ -1110,10 +1214,12 @@ export const unpinChat = mutation({
         message: "Unauthorized: Chat does not belong to user",
       });
     }
+    if (chat.pinned_at == null) {
+      return null; // Already unpinned
+    }
 
     await ctx.db.patch(chat._id, {
       pinned_at: undefined,
-      update_time: Date.now(),
     });
     return null;
   },
@@ -1534,6 +1640,12 @@ export const setActiveTriggerRun = mutation({
       .withIndex("by_chat_id", (q) => q.eq("id", args.chatId))
       .first();
     if (!chat) return "not_found" as const;
+    if (
+      args.triggerRunId !== null &&
+      (await isUserDeletionFenced(ctx.db, chat.user_id))
+    ) {
+      return "deleting" as const;
+    }
     if (chat.deletion_started_at !== undefined && args.triggerRunId !== null) {
       return "deleting" as const;
     }
@@ -1551,9 +1663,12 @@ export const setActiveTriggerRun = mutation({
     }
     const shouldClearApprovalPending =
       args.clearApprovalPending === true || args.triggerRunId !== null;
+    const finishedActiveRun =
+      args.triggerRunId === null && chat.active_trigger_run_id !== undefined;
 
     await ctx.db.patch(chat._id, {
       active_trigger_run_id: args.triggerRunId ?? undefined,
+      ...(finishedActiveRun ? { last_run_finished_at: Date.now() } : {}),
       ...(args.triggerRunId !== null ? { canceled_at: undefined } : {}),
       ...(args.approvalSessionId !== undefined
         ? {
@@ -1580,32 +1695,60 @@ export const setActiveAgentApprovalPending = mutation({
     request: v.optional(activeAgentApprovalRequestValidator),
     expectedRunId: v.optional(v.string()),
     expectedApprovalSessionId: v.optional(v.string()),
+    expectedApprovalId: v.optional(v.string()),
   },
-  returns: v.null(),
+  returns: v.union(
+    v.literal("acquired"),
+    v.literal("released"),
+    v.literal("busy"),
+    v.literal("stale"),
+    v.literal("not_found"),
+  ),
   handler: async (ctx, args) => {
     validateServiceKey(args.serviceKey);
     const chat = await ctx.db
       .query("chats")
       .withIndex("by_chat_id", (q) => q.eq("id", args.chatId))
       .first();
-    if (!chat) return null;
+    if (!chat) return "not_found" as const;
     if (
       args.expectedRunId !== undefined &&
       chat.active_trigger_run_id !== args.expectedRunId
     ) {
-      return null;
+      return "stale" as const;
     }
     if (
       args.expectedApprovalSessionId !== undefined &&
       chat.active_agent_approval_session_id !== args.expectedApprovalSessionId
     ) {
-      return null;
+      return "stale" as const;
+    }
+    if (args.pending) {
+      if (!args.request) return "stale" as const;
+      const activeApprovalId = chat.active_agent_approval_request?.approvalId;
+      if (
+        chat.active_agent_approval_pending === true &&
+        activeApprovalId !== args.request.approvalId
+      ) {
+        return "busy" as const;
+      }
+      await ctx.db.patch(chat._id, {
+        active_agent_approval_pending: true,
+        active_agent_approval_request: args.request,
+      });
+      return "acquired" as const;
+    }
+    if (
+      args.expectedApprovalId !== undefined &&
+      chat.active_agent_approval_request?.approvalId !== args.expectedApprovalId
+    ) {
+      return "stale" as const;
     }
     await ctx.db.patch(chat._id, {
-      active_agent_approval_pending: args.pending ? true : undefined,
-      active_agent_approval_request: args.pending ? args.request : undefined,
+      active_agent_approval_pending: undefined,
+      active_agent_approval_request: undefined,
     });
-    return null;
+    return "released" as const;
   },
 });
 
@@ -1771,7 +1914,11 @@ export const deleteAllChatsForUser = mutation({
                   await ctx.scheduler.runAfter(
                     0,
                     internal.s3Cleanup.deleteS3ObjectAction,
-                    { s3Key: file.s3_key },
+                    {
+                      s3Key: file.s3_key,
+                      ...(file.s3_region ? { s3Region: file.s3_region } : {}),
+                      ...(file.s3_bucket ? { s3Bucket: file.s3_bucket } : {}),
+                    },
                   );
                 }
                 await fileCountAggregate.deleteIfExists(ctx, file);
@@ -1818,6 +1965,10 @@ export const deleteAllChatsForUser = mutation({
         }
       }
 
+      while (await deleteSubagentDataForChat(ctx, chat.id)) {
+        // Test-hygiene helper intentionally drains the whole chat in one call.
+      }
+      await deleteModelHistory(ctx, chat.id);
       await ctx.db.delete(chat._id);
     }
 
@@ -2071,6 +2222,45 @@ export const saveLatestSummary = mutation({
       });
       throw error;
     }
+  },
+});
+
+/**
+ * Attach a transcript sidecar to the current summary after the sandbox write
+ * completes. The cutoff guard prevents a late background save from replacing
+ * a newer compaction checkpoint.
+ */
+export const attachLatestSummaryTranscript = mutation({
+  args: {
+    serviceKey: v.string(),
+    chatId: v.string(),
+    summaryUpToMessageId: v.string(),
+    summaryText: v.string(),
+    transcriptPath: v.string(),
+  },
+  returns: v.boolean(),
+  handler: async (ctx, args) => {
+    validateServiceKey(args.serviceKey);
+
+    const chat = await ctx.db
+      .query("chats")
+      .withIndex("by_chat_id", (q) => q.eq("id", args.chatId))
+      .first();
+    if (!chat?.latest_summary_id) return false;
+
+    const summary = await ctx.db.get(chat.latest_summary_id);
+    if (
+      !summary ||
+      summary.summary_up_to_message_id !== args.summaryUpToMessageId
+    ) {
+      return false;
+    }
+
+    await ctx.db.patch(summary._id, {
+      summary_text: args.summaryText,
+      transcript_path: args.transcriptPath,
+    });
+    return true;
   },
 });
 

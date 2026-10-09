@@ -12,11 +12,13 @@
  *   npx @hackerai/local --token TOKEN
  */
 
+import { OperationChannelRouter } from "./operation-channels";
 import { ConvexHttpClient } from "convex/browser";
 import { Centrifuge, Subscription, PublicationContext } from "centrifuge";
 import WebSocket from "ws";
 import { spawn, ChildProcess } from "child_process";
 import os from "os";
+import { getEnvironmentId } from "./environment-identity";
 import {
   truncateOutput,
   MAX_OUTPUT_SIZE,
@@ -33,6 +35,12 @@ import {
   confirmProcessTermination,
   isProcessTreeTerminationConfirmed,
 } from "./command-cancellation";
+import {
+  CentrifugoMessageReassembler,
+  CentrifugoPublishQueue,
+} from "./centrifugo-transport";
+import { buildCentrifugoTransportConfig } from "./centrifugo-endpoints";
+import { hardenExistingTerminalArtifacts } from "./private-artifact-hardening";
 
 const DEFAULT_SHELL = getDefaultShell(os.platform());
 
@@ -49,6 +57,7 @@ const PRODUCTION_CONVEX_URL = "https://convex.haiusercontent.com";
 const api = {
   localSandbox: {
     connect: "localSandbox:connect" as const,
+    ready: "localSandbox:ready" as const,
     disconnect: "localSandbox:disconnect" as const,
     refreshCentrifugoToken: "localSandbox:refreshCentrifugoToken" as const,
   },
@@ -65,7 +74,7 @@ const chalk = {
   bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
 };
 
-interface Config {
+export interface Config {
   convexUrl: string;
   token: string;
   name: string;
@@ -81,12 +90,16 @@ interface OsInfo {
 interface ClientCapabilities {
   commands: boolean;
   pty: boolean;
+  commandStdin: boolean;
+  operationChannels: boolean;
 }
 
 interface CentrifugoCommandMessage {
   type: "command";
   commandId: string;
   command: string;
+  stdin?: string;
+  stdinEncoding?: "utf8" | "base64";
   env?: Record<string, string>;
   cwd?: string;
   timeout?: number;
@@ -258,6 +271,7 @@ type RefreshTokenResult =
         | "desktop_kicked_by_new_session"
         | "token_regenerated"
         | "presence_sweep"
+        | "command_unresponsive"
         | null;
       msSinceDisconnected: number | null;
       msSinceLastHeartbeat: number | null;
@@ -274,7 +288,11 @@ function isInvalidTokenError(error: unknown): boolean {
   return (data as { code?: string }).code === "UNAUTHORIZED";
 }
 
-class LocalSandboxClient {
+type LocalSandboxClientOptions = {
+  onExitRequested?: (code: number, error: Error) => void;
+};
+
+export class LocalSandboxClient {
   private convexHttp: ConvexHttpClient;
   private centrifuge?: Centrifuge;
   private subscription?: Subscription;
@@ -285,12 +303,47 @@ class LocalSandboxClient {
   private idleCheckInterval?: NodeJS.Timeout;
   private processRunner: ProcessRunner;
   private activeStreamCommands: Map<string, ChildProcess> = new Map();
+  private publishQueue?: CentrifugoPublishQueue;
+  private operationRouter?: OperationChannelRouter<Subscription>;
+  private incomingReassembler = new CentrifugoMessageReassembler();
+  private cleanupPromise?: Promise<void>;
+  private exitRequested = false;
+  private relayTransport: string | null = null;
+  private privateArtifactStorageReady = false;
 
-  constructor(private config: Config) {
+  constructor(
+    private config: Config,
+    private readonly options: LocalSandboxClientOptions = {},
+  ) {
     this.convexHttp = new ConvexHttpClient(config.convexUrl);
     this.lastActivityTime = Date.now();
     this.processRunner = new ProcessRunner();
     this.setupProcessRunnerListeners();
+  }
+
+  private requestExit(code: number, error: Error): void {
+    if (this.exitRequested || this.isShuttingDown) return;
+    this.exitRequested = true;
+    void this.cleanup().then(
+      () => {
+        if (this.options.onExitRequested) {
+          this.options.onExitRequested(code, error);
+        } else {
+          process.exit(code);
+        }
+      },
+      (cleanupError) => {
+        const fatal =
+          cleanupError instanceof Error
+            ? cleanupError
+            : new Error(String(cleanupError));
+        if (this.options.onExitRequested) {
+          this.options.onExitRequested(code, fatal);
+        } else {
+          process.exit(code);
+        }
+      },
+    );
   }
 
   private setupProcessRunnerListeners(): void {
@@ -350,6 +403,7 @@ class LocalSandboxClient {
         "⚠️  Commands run directly on your OS without any isolation.",
       ),
     );
+    this.privateArtifactStorageReady = await hardenExistingTerminalArtifacts();
     await this.connect();
   }
 
@@ -366,6 +420,8 @@ class LocalSandboxClient {
     return {
       commands: true,
       pty: isPtyAvailable(),
+      commandStdin: this.privateArtifactStorageReady,
+      operationChannels: true,
     };
   }
 
@@ -377,6 +433,7 @@ class LocalSandboxClient {
         api.localSandbox.connect as never,
         {
           token: this.config.token,
+          environmentId: await getEnvironmentId(),
           connectionName: this.config.name,
           clientVersion: "1.0.0",
           osInfo: this.getOsInfo(),
@@ -396,10 +453,26 @@ class LocalSandboxClient {
       this.connectionId = result.connectionId;
 
       console.log(chalk.green("✓ Authenticated"));
+      console.log(chalk.blue("Connecting to command relay..."));
+
+      await this.setupCentrifugo(
+        result.centrifugoWsUrl,
+        result.centrifugoToken,
+      );
+      await this.convexHttp.mutation(
+        api.localSandbox.ready as never,
+        {
+          token: this.config.token,
+          connectionId: this.connectionId,
+        } as never,
+      );
+      console.log(
+        chalk.green(
+          `✓ Connected to command relay (${this.relayTransport ?? "unknown transport"})`,
+        ),
+      );
       console.log(chalk.bold(chalk.green("🎉 Local sandbox is ready!")));
       console.log(chalk.gray(`Connection: ${this.connectionId}`));
-
-      this.setupCentrifugo(result.centrifugoWsUrl, result.centrifugoToken);
       this.startIdleCheck();
     } catch (error: unknown) {
       const err = error as { data?: { message?: string }; message?: string };
@@ -412,14 +485,25 @@ class LocalSandboxClient {
       ) {
         console.error(chalk.yellow("Please regenerate your token in Settings"));
       }
-      await this.cleanup();
-      process.exit(1);
+      await this.cleanup().catch((cleanupError: unknown) => {
+        const detail =
+          cleanupError instanceof Error
+            ? cleanupError.message
+            : String(cleanupError);
+        console.warn(chalk.yellow(`⚠️  Cleanup incomplete: ${detail}`));
+      });
+      throw error;
     }
   }
 
-  private setupCentrifugo(wsUrl: string, initialToken: string): void {
-    this.centrifuge = new Centrifuge(wsUrl, {
+  private async setupCentrifugo(
+    wsUrl: string,
+    initialToken: string,
+  ): Promise<void> {
+    const transportConfig = buildCentrifugoTransportConfig(wsUrl);
+    this.centrifuge = new Centrifuge(transportConfig.endpoints, {
       websocket: WebSocket as unknown as typeof globalThis.WebSocket,
+      emulationEndpoint: transportConfig.emulationEndpoint,
       token: initialToken,
       getToken: async (): Promise<string> => {
         if (!this.connectionId) {
@@ -443,7 +527,7 @@ class LocalSandboxClient {
             // cleanup() synchronously calls centrifuge.disconnect() before any
             // awaits, so by the time we re-throw below Centrifuge is in a
             // terminal state and won't invoke getToken again.
-            this.cleanup().then(() => process.exit(1));
+            this.requestExit(1, new Error("Centrifugo token was rejected"));
           } else {
             console.error(
               chalk.red("Failed to refresh Centrifugo token:"),
@@ -462,12 +546,14 @@ class LocalSandboxClient {
             ? "Your token was regenerated; rerun with the new token."
             : result.disconnectReason === "presence_sweep"
               ? "Server presence sweep marked this connection stale."
-              : result.disconnectReason === "desktop_kicked_by_new_session"
-                ? "A new desktop session took over."
-                : result.disconnectReason === "client_disconnect" ||
-                    result.disconnectReason === "desktop_disconnect"
-                  ? "This connection was explicitly disconnected."
-                  : "Likely causes: token regenerated, or disconnected from another session.";
+              : result.disconnectReason === "command_unresponsive"
+                ? "Server stopped this connection after repeated commands received no response. Restart HackerAI Local and try again."
+                : result.disconnectReason === "desktop_kicked_by_new_session"
+                  ? "A new desktop session took over."
+                  : result.disconnectReason === "client_disconnect" ||
+                      result.disconnectReason === "desktop_disconnect"
+                    ? "This connection was explicitly disconnected."
+                    : "Likely causes: token regenerated, or disconnected from another session.";
         console.error(chalk.yellow(reasonHint));
         console.error(
           chalk.gray(
@@ -484,18 +570,25 @@ class LocalSandboxClient {
         // calls centrifuge.disconnect() before any awaits, so by the time we
         // throw below Centrifuge is in a terminal state and won't invoke
         // getToken again.
-        this.cleanup().then(() => process.exit(1));
+        this.requestExit(
+          1,
+          new Error(`Centrifugo refresh aborted: ${result.reason}`),
+        );
         throw new Error(`Centrifugo refresh aborted: ${result.reason}`);
       },
     });
 
     const channel = `sandbox:connection:${this.connectionId}#${this.userId}`;
     this.subscription = this.centrifuge.newSubscription(channel);
+    this.publishQueue = new CentrifugoPublishQueue(async (message) => {
+      if (!this.subscription) {
+        throw new Error("Cannot publish: no active subscription");
+      }
+      await this.subscription.publish(message);
+    });
 
-    this.subscription.on("publication", (ctx: PublicationContext) => {
+    const handleIncoming = (message: unknown) => {
       if (this.isShuttingDown) return;
-
-      const message = ctx.data;
 
       if (!isTargetedIncomingMessage(message)) {
         return;
@@ -557,6 +650,21 @@ class LocalSandboxClient {
         default:
           break;
       }
+    };
+    const operationRouter = new OperationChannelRouter<Subscription>(
+      this.centrifuge,
+      this.userId!,
+      this.connectionId!,
+    );
+    this.operationRouter = operationRouter;
+    this.subscription.on("publication", (ctx: PublicationContext) => {
+      const message = this.incomingReassembler.accept(ctx.data);
+      if (!message || this.isShuttingDown) return;
+      void operationRouter
+        .dispatch(message, handleIncoming)
+        .catch((error: unknown) => {
+          console.error("Operation subscription failed:", error);
+        });
     });
 
     this.centrifuge.on("disconnected", (ctx) => {
@@ -572,7 +680,7 @@ class LocalSandboxClient {
           console.error(
             chalk.yellow("Please try again later or contact support."),
           );
-          this.cleanup().then(() => process.exit(1));
+          this.requestExit(1, new Error("Centrifugo connection limit reached"));
         } else {
           console.log(
             chalk.yellow(`⚠️  Disconnected from Centrifugo: ${ctx.reason}`),
@@ -581,23 +689,51 @@ class LocalSandboxClient {
       }
     });
 
-    this.centrifuge.on("connected", () => {
-      console.log(chalk.green("✓ Connected to command relay"));
+    this.centrifuge.on("connected", (ctx) => {
+      this.relayTransport = ctx.transport;
+    });
+
+    const ready = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("Timed out connecting to the command relay"));
+      }, 20_000);
+      const finish = (error?: Error) => {
+        clearTimeout(timeout);
+        if (error) reject(error);
+        else resolve();
+      };
+      this.subscription?.once("subscribed", () => finish());
+      this.subscription?.on("error", (ctx) => {
+        console.warn(
+          chalk.yellow(
+            `Command relay subscription error; retrying: ${ctx.error?.message ?? "unknown"}`,
+          ),
+        );
+      });
     });
 
     this.subscription.subscribe();
     this.centrifuge.connect();
+    await ready;
   }
 
   private async publishToChannel(
     data: CentrifugoOutgoingMessage,
   ): Promise<void> {
-    if (!this.subscription) {
+    if (!this.publishQueue) {
       console.error(chalk.red("Cannot publish: no active subscription"));
       return;
     }
     try {
-      await this.subscription.publish(data);
+      const queue = this.publishQueue;
+      const payload = data as unknown as Record<string, unknown>;
+      if (this.operationRouter) {
+        await this.operationRouter.publish(payload, (value) =>
+          queue.publish(value),
+        );
+      } else {
+        await queue.publish(payload);
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : JSON.stringify(err);
       console.error(chalk.red(`Publish failed: ${msg}`));
@@ -606,8 +742,17 @@ class LocalSandboxClient {
   }
 
   private async handleCommand(msg: CentrifugoCommandMessage): Promise<void> {
-    const { commandId, command, env, cwd, timeout, background, displayName } =
-      msg;
+    const {
+      commandId,
+      command,
+      stdin,
+      stdinEncoding,
+      env,
+      cwd,
+      timeout,
+      background,
+      displayName,
+    } = msg;
 
     // Determine what to show in console:
     // - displayName === "" (empty string): hide command entirely
@@ -660,6 +805,9 @@ class LocalSandboxClient {
       }
 
       if (background) {
+        if (stdin !== undefined) {
+          throw new Error("Background commands do not accept stdin");
+        }
         const pid = await this.spawnBackground(fullCommand);
         await this.publishToChannel({
           type: "exit",
@@ -679,6 +827,11 @@ class LocalSandboxClient {
         timeout,
         shouldShow,
         displayText,
+        stdin === undefined
+          ? undefined
+          : stdinEncoding === "base64"
+            ? Buffer.from(stdin, "base64")
+            : stdin,
       );
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
@@ -702,7 +855,7 @@ class LocalSandboxClient {
           undefined,
           () => isProcessTreeTerminationConfirmed(proc),
         )
-      : false;
+      : true;
     await this.publishToChannel({
       type: "command_cancel_result",
       commandId: msg.commandId,
@@ -743,14 +896,29 @@ class LocalSandboxClient {
     }, 1000).unref();
   }
 
-  private terminateActiveStreamCommands(): void {
-    for (const [commandId, proc] of this.activeStreamCommands) {
-      console.log(
-        chalk.yellow(`[CMD] Terminating active command ${commandId}`),
+  private async terminateActiveStreamCommands(): Promise<void> {
+    const commands = [...this.activeStreamCommands.entries()];
+    const results = await Promise.all(
+      commands.map(async ([commandId, proc]) => {
+        console.log(
+          chalk.yellow(`[CMD] Terminating active command ${commandId}`),
+        );
+        const confirmed = await confirmProcessTermination(
+          proc,
+          () => this.terminateProcessTree(proc),
+          undefined,
+          () => isProcessTreeTerminationConfirmed(proc),
+        );
+        if (confirmed) this.activeStreamCommands.delete(commandId);
+        return confirmed;
+      }),
+    );
+    const unconfirmed = results.filter((confirmed) => !confirmed).length;
+    if (unconfirmed > 0) {
+      throw new Error(
+        `Could not confirm termination of ${unconfirmed} command process tree(s)`,
       );
-      this.terminateProcessTree(proc);
     }
-    this.activeStreamCommands.clear();
   }
 
   private async streamCommand(
@@ -759,6 +927,7 @@ class LocalSandboxClient {
     timeout: number | undefined,
     shouldShow: boolean,
     displayText: string,
+    stdin?: string | Buffer,
   ): Promise<void> {
     const startTime = Date.now();
     const commandTimeout = timeout ?? 30000;
@@ -773,11 +942,19 @@ class LocalSandboxClient {
         fullCommand,
       );
       const proc = spawn(DEFAULT_SHELL.shell, spawnSpec.args, {
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
         detached: os.platform() !== "win32",
         ...spawnSpec.options,
       });
       this.activeStreamCommands.set(commandId, proc);
+
+      if (stdin !== undefined) {
+        proc.stdin?.on("error", () => {
+          // The child exit path reports the command result. EPIPE here only
+          // means it stopped reading before the complete private payload.
+        });
+        proc.stdin?.end(stdin);
+      }
 
       if (commandTimeout > 0) {
         timeoutId = setTimeout(() => {
@@ -819,7 +996,7 @@ class LocalSandboxClient {
         });
       });
 
-      proc.on("close", (code) => {
+      proc.on("close", async (code) => {
         if (timeoutId) clearTimeout(timeoutId);
         this.activeStreamCommands.delete(commandId);
 
@@ -840,7 +1017,7 @@ class LocalSandboxClient {
           });
         }
 
-        this.publishToChannel({
+        await this.publishToChannel({
           type: "exit",
           commandId,
           exitCode,
@@ -877,7 +1054,7 @@ class LocalSandboxClient {
         resolve();
       });
 
-      proc.on("error", (error) => {
+      proc.on("error", async (error) => {
         if (timeoutId) clearTimeout(timeoutId);
         this.activeStreamCommands.delete(commandId);
         this.publishToChannel({
@@ -891,7 +1068,7 @@ class LocalSandboxClient {
             ),
           );
         });
-        this.publishToChannel({
+        await this.publishToChannel({
           type: "exit",
           commandId,
           exitCode: 1,
@@ -1004,7 +1181,7 @@ class LocalSandboxClient {
           ),
         );
         console.log(chalk.yellow("Auto-terminating to save resources..."));
-        this.cleanup().then(() => process.exit(0));
+        this.requestExit(0, new Error("Local sandbox idle timeout"));
       }
     }, IDLE_CHECK_INTERVAL_MS);
   }
@@ -1017,6 +1194,15 @@ class LocalSandboxClient {
   }
 
   async cleanup(): Promise<void> {
+    if (this.cleanupPromise) return this.cleanupPromise;
+    this.cleanupPromise = this.performCleanup().catch((error) => {
+      this.cleanupPromise = undefined;
+      throw error;
+    });
+    return this.cleanupPromise;
+  }
+
+  private async performCleanup(): Promise<void> {
     console.log(chalk.blue("\n🧹 Cleaning up..."));
 
     this.isShuttingDown = true;
@@ -1026,43 +1212,47 @@ class LocalSandboxClient {
     this.processRunner.stopAll();
 
     // Stop all active streamed commands before dropping the realtime connection.
-    this.terminateActiveStreamCommands();
+    await this.terminateActiveStreamCommands();
 
     // Disconnect Centrifugo
     if (this.subscription) {
       this.subscription.unsubscribe();
       this.subscription = undefined;
     }
+    this.publishQueue = undefined;
+    this.operationRouter?.stop();
+    this.operationRouter = undefined;
     if (this.centrifuge) {
       this.centrifuge.disconnect();
       this.centrifuge = undefined;
     }
 
-    // Set up force-exit timeout (5 seconds)
-    const forceExitTimeout = setTimeout(() => {
-      console.log(chalk.yellow("⚠️  Force exiting after 5 second timeout..."));
-      process.exit(1);
-    }, 5000);
-
-    try {
-      if (this.connectionId) {
-        try {
-          await this.convexHttp.mutation(
+    if (this.connectionId) {
+      let disconnectTimeout: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          this.convexHttp.mutation(
             api.localSandbox.disconnect as never,
             {
               token: this.config.token,
               connectionId: this.connectionId,
             } as never,
-          );
-          console.log(chalk.green("✓ Disconnected"));
-        } catch (error: unknown) {
-          const message =
-            error instanceof Error ? error.message : String(error);
-          console.warn(chalk.yellow(`⚠️  Failed to disconnect: ${message}`));
-        }
+          ),
+          new Promise<never>(
+            (_, reject) =>
+              (disconnectTimeout = setTimeout(
+                () => reject(new Error("Disconnect timed out after 5 seconds")),
+                5_000,
+              )),
+          ),
+        ]);
+        console.log(chalk.green("✓ Disconnected"));
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(chalk.yellow(`⚠️  Failed to disconnect: ${message}`));
+      } finally {
+        if (disconnectTimeout) clearTimeout(disconnectTimeout);
       }
-    } finally {
-      clearTimeout(forceExitTimeout);
     }
   }
 }
@@ -1078,9 +1268,10 @@ const hasFlag = (flag: string): boolean => {
   return args.includes(flag);
 };
 
-// Show help
-if (hasFlag("--help") || hasFlag("-h")) {
-  console.log(`
+export function main(): void {
+  // Show help
+  if (hasFlag("--help") || hasFlag("-h")) {
+    console.log(`
 ${chalk.bold("HackerAI Local Sandbox Client")}
 
 ${chalk.yellow("Usage:")}
@@ -1104,37 +1295,64 @@ ${chalk.cyan("Auto-termination:")}
   The client automatically terminates after 1 hour of inactivity (no commands
   executed) to save system resources.
 `);
-  process.exit(0);
+    process.exit(0);
+  }
+
+  const config: Config = {
+    convexUrl: getArg("--convex-url") || PRODUCTION_CONVEX_URL,
+    token: getArg("--token") || "",
+    name: getArg("--name") || os.hostname(),
+  };
+
+  if (!config.token) {
+    console.error(chalk.red("❌ No authentication token provided"));
+    console.error(
+      chalk.yellow("Usage: npx @hackerai/local --token YOUR_TOKEN"),
+    );
+    console.error(
+      chalk.yellow("Get your token from HackerAI Settings > Agents"),
+    );
+    process.exit(1);
+  }
+
+  const client = new LocalSandboxClient(config);
+
+  process.on("SIGINT", async () => {
+    console.log(chalk.yellow("\n🛑 Shutting down..."));
+    try {
+      await client.cleanup();
+      process.exit(0);
+    } catch (error) {
+      console.error(
+        chalk.red(
+          `Cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+      process.exit(1);
+    }
+  });
+
+  process.on("SIGTERM", async () => {
+    try {
+      await client.cleanup();
+      process.exit(0);
+    } catch (error) {
+      console.error(
+        chalk.red(
+          `Cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+      process.exit(1);
+    }
+  });
+
+  client.start().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(chalk.red("Fatal error:"), message);
+    process.exit(1);
+  });
 }
 
-const config: Config = {
-  convexUrl: getArg("--convex-url") || PRODUCTION_CONVEX_URL,
-  token: getArg("--token") || "",
-  name: getArg("--name") || os.hostname(),
-};
-
-if (!config.token) {
-  console.error(chalk.red("❌ No authentication token provided"));
-  console.error(chalk.yellow("Usage: npx @hackerai/local --token YOUR_TOKEN"));
-  console.error(chalk.yellow("Get your token from HackerAI Settings > Agents"));
-  process.exit(1);
+if (require.main === module) {
+  main();
 }
-
-const client = new LocalSandboxClient(config);
-
-process.on("SIGINT", async () => {
-  console.log(chalk.yellow("\n🛑 Shutting down..."));
-  await client.cleanup();
-  process.exit(0);
-});
-
-process.on("SIGTERM", async () => {
-  await client.cleanup();
-  process.exit(0);
-});
-
-client.start().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(chalk.red("Fatal error:"), message);
-  process.exit(1);
-});

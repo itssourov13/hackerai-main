@@ -12,6 +12,7 @@ jest.mock("../_generated/server", () => ({
 }));
 
 jest.mock("convex/values", () => ({
+  ...jest.requireActual<typeof import("convex/values")>("convex/values"),
   v: new Proxy(
     {},
     {
@@ -23,6 +24,7 @@ jest.mock("convex/values", () => ({
 jest.mock("../_generated/api", () => ({
   internal: {
     s3Cleanup: {
+      deleteTrackedS3Object: "deleteTrackedS3Object",
       deleteS3ObjectsBatchAction: "deleteS3ObjectsBatchAction",
     },
   },
@@ -38,20 +40,37 @@ jest.mock("../fileAggregate", () => ({
 
 type Row = { _id: string; [key: string]: any };
 type Tables = Record<string, Row[]>;
-type ReadCounter = { value: number };
+type ReadCounter = { value: number; bytes: number };
+const { getDocumentSize } =
+  jest.requireActual<typeof import("convex/values")>("convex/values");
+
+function countBytes(counter: ReadCounter, row: Row | null | undefined) {
+  if (row) counter.bytes += getDocumentSize(row);
+  if (counter.bytes > 16 * 1024 * 1024)
+    throw new Error("transaction read limit exceeded");
+}
 
 function createQueryResult(rows: Row[], readCounter: ReadCounter) {
   return {
+    async *[Symbol.asyncIterator]() {
+      for (const row of rows) {
+        readCounter.value += 1;
+        countBytes(readCounter, row);
+        yield row;
+      }
+    },
     collect: jest.fn(async () => rows),
     first: jest.fn(async () => {
       const result = rows[0] ?? null;
       if (result) readCounter.value += 1;
+      countBytes(readCounter, result);
       return result;
     }),
     unique: jest.fn(async () => rows[0] ?? null),
     take: jest.fn(async (limit: number) => {
       const result = rows.slice(0, limit);
       readCounter.value += result.length;
+      result.forEach((row) => countBytes(readCounter, row));
       return result;
     }),
     order: jest.fn(() => createQueryResult(rows, readCounter)),
@@ -97,6 +116,7 @@ function createQueryBuilder(
         const start = cursor ? Number(cursor) : 0;
         const page = tableRows().slice(start, start + numItems);
         readCounter.value += page.length;
+        page.forEach((row) => countBytes(readCounter, row));
         const next = start + page.length;
         return {
           page,
@@ -111,10 +131,11 @@ function createQueryBuilder(
 function createMockCtx(tables: Tables, subject = "user_123") {
   const deletedIds: string[] = [];
   const patches: Array<{ id: string; patch: Record<string, any> }> = [];
-  const readCounter: ReadCounter = { value: 0 };
+  const readCounter: ReadCounter = { value: 0, bytes: 0 };
   const scheduler = {
     runAfter: jest.fn().mockResolvedValue(undefined),
   };
+  let insertedDocuments = 0;
 
   const db = {
     query: jest.fn((table: string) =>
@@ -124,12 +145,20 @@ function createMockCtx(tables: Tables, subject = "user_123") {
       readCounter.value += 1;
       for (const rows of Object.values(tables)) {
         const row = rows.find((candidate) => candidate._id === id);
-        if (row) return row;
+        if (row) {
+          countBytes(readCounter, row);
+          return row;
+        }
       }
       return null;
     }),
     delete: jest.fn(async (id: string) => {
       deletedIds.push(id);
+      for (const rows of Object.values(tables))
+        countBytes(
+          readCounter,
+          rows.find((row) => row._id === id),
+        );
       for (const [table, rows] of Object.entries(tables)) {
         const next = rows.filter((row) => row._id !== id);
         if (next.length !== rows.length) {
@@ -142,6 +171,7 @@ function createMockCtx(tables: Tables, subject = "user_123") {
       for (const rows of Object.values(tables)) {
         const row = rows.find((candidate) => candidate._id === id);
         if (!row) continue;
+        countBytes(readCounter, row);
         for (const [key, value] of Object.entries(patch)) {
           if (value === undefined) {
             delete row[key];
@@ -150,6 +180,12 @@ function createMockCtx(tables: Tables, subject = "user_123") {
           }
         }
       }
+    }),
+    insert: jest.fn(async (table: string, value: Record<string, any>) => {
+      insertedDocuments += 1;
+      const id = `inserted-${table}-${insertedDocuments}`;
+      (tables[table] ??= []).push({ _id: id, ...value });
+      return id;
     }),
   };
 
@@ -291,9 +327,39 @@ function seedTables(userId = "user_123", otherUserId = "user_other"): Tables {
         updated_at: 1,
       },
     ],
-    temp_streams: [
-      { _id: "stream-user", chat_id: "chat-1", user_id: userId },
-      { _id: "stream-other", chat_id: "chat-other-id", user_id: otherUserId },
+    subscription_pauses: [
+      {
+        _id: "pause-user",
+        user_id: userId,
+        organization_id: "org_personal",
+        stripe_customer_id: "cus_user",
+        stripe_subscription_id: "sub_user",
+        stripe_price_id: "price_user",
+        quantity: 1,
+        pause_months: 1,
+        requested_at: 1,
+        pause_effective_at: 2,
+        resume_at: 3,
+        status: "paused",
+        resume_attempt_count: 0,
+        updated_at: 1,
+      },
+      {
+        _id: "pause-other",
+        user_id: otherUserId,
+        organization_id: "org_other",
+        stripe_customer_id: "cus_other",
+        stripe_subscription_id: "sub_other",
+        stripe_price_id: "price_other",
+        quantity: 1,
+        pause_months: 1,
+        requested_at: 1,
+        pause_effective_at: 2,
+        resume_at: 3,
+        status: "paused",
+        resume_attempt_count: 0,
+        updated_at: 1,
+      },
     ],
     local_sandbox_tokens: [
       { _id: "token-user", user_id: userId, token: "secret" },
@@ -337,11 +403,32 @@ function seedTables(userId = "user_123", otherUserId = "user_other"): Tables {
         updated_at: 1,
       },
     ],
+    involuntary_churn_events: [
+      {
+        _id: "churn-user",
+        user_id: userId,
+        idempotency_key: `evt-user:${userId}`,
+        stripe_event_id: "evt-user",
+        stripe_invoice_id: "in-user",
+        recovery_result: "churned",
+        occurred_at: 1,
+      },
+      {
+        _id: "churn-other",
+        user_id: otherUserId,
+        idempotency_key: `evt-other:${otherUserId}`,
+        stripe_event_id: "evt-other",
+        stripe_invoice_id: "in-other",
+        recovery_result: "pending",
+        occurred_at: 1,
+      },
+    ],
     usage_logs: [
       {
         _id: "usage-user",
         user_id: userId,
         chat_id: "chat-1",
+        assistant_message_id: "assistant-message-1",
         model: "model",
         total_tokens: 10,
       },
@@ -510,6 +597,105 @@ function seedTables(userId = "user_123", otherUserId = "user_other"): Tables {
     ],
     processed_webhooks: [{ _id: "webhook", event_id: "evt_1" }],
     processed_checkout_sessions: [{ _id: "checkout", session_key: "cs_1" }],
+    user_deletion_fences: [
+      { _id: "fence-user", user_id: userId, started_at: 1 },
+      { _id: "fence-other", user_id: otherUserId, started_at: 1 },
+    ],
+    subagent_runs: [
+      {
+        _id: "subagent-run-user",
+        subagent_id: "sa-user",
+        user_id: userId,
+        chat_id: "chat-1",
+        status: "completed",
+      },
+      {
+        _id: "subagent-run-other",
+        subagent_id: "sa-other",
+        user_id: otherUserId,
+        chat_id: "chat-other-id",
+        status: "completed",
+      },
+    ],
+    subagent_messages: [
+      {
+        _id: "subagent-message-user",
+        subagent_id: "sa-user",
+        user_id: userId,
+      },
+      {
+        _id: "subagent-message-other",
+        subagent_id: "sa-other",
+        user_id: otherUserId,
+      },
+    ],
+    subagent_events: [
+      {
+        _id: "subagent-event-user",
+        subagent_id: "sa-user",
+        user_id: userId,
+      },
+      {
+        _id: "subagent-event-other",
+        subagent_id: "sa-other",
+        user_id: otherUserId,
+      },
+    ],
+    subagent_work_items: [
+      {
+        _id: "subagent-work-user",
+        subagent_id: "sa-user",
+        user_id: userId,
+      },
+      {
+        _id: "subagent-work-other",
+        subagent_id: "sa-other",
+        user_id: otherUserId,
+      },
+    ],
+    research_runs: [
+      {
+        _id: "research-run",
+        analysis_id: "analysis-1",
+        cohort_size: 3,
+        status: "completed",
+      },
+    ],
+    research_reports: [
+      {
+        _id: "research-report",
+        analysis_id: "analysis-1",
+        report: { answerToQuestion: "Cohort-level answer" },
+      },
+    ],
+    research_user_profiles: [
+      {
+        _id: "research-profile-user",
+        analysis_id: "analysis-1",
+        user_id: userId,
+        pseudonym: "U01",
+      },
+      {
+        _id: "research-profile-other",
+        analysis_id: "analysis-1",
+        user_id: otherUserId,
+        pseudonym: "U02",
+      },
+    ],
+    research_run_members: [
+      {
+        _id: "research-member-user",
+        analysis_id: "analysis-1",
+        user_id: userId,
+        pseudonym: "U01",
+      },
+      {
+        _id: "research-member-other",
+        analysis_id: "analysis-1",
+        user_id: otherUserId,
+        pseudonym: "U02",
+      },
+    ],
   };
 }
 
@@ -530,12 +716,18 @@ describe("userDeletion", () => {
   });
 
   it("deletes product data, anonymizes ledgers, and retains aggregate tables", async () => {
-    const { deleteAllUserData, DELETED_USER_ID, USER_DELETION_TABLE_POLICY } =
-      await import("../userDeletion");
+    const {
+      deleteAllUserDataByService,
+      DELETED_USER_ID,
+      USER_DELETION_TABLE_POLICY,
+    } = await import("../userDeletion");
     const tables = seedTables();
     const { ctx, scheduler, deletedIds } = createMockCtx(tables);
 
-    await deleteAllUserData.handler(ctx as any, {});
+    await deleteAllUserDataByService.handler(ctx as any, {
+      serviceKey: "service_key",
+      userId: "user_123",
+    });
 
     for (const table of USER_DELETION_TABLE_POLICY.delete) {
       expect(
@@ -548,6 +740,33 @@ describe("userDeletion", () => {
     expect(row(tables, "chats", "chat-other")).toBeTruthy();
     expect(row(tables, "feedback", "feedback-other")).toBeTruthy();
     expect(row(tables, "files", "file-other")).toBeTruthy();
+    expect(row(tables, "subscription_pauses", "pause-user")).toBeUndefined();
+    expect(row(tables, "subscription_pauses", "pause-other")).toBeTruthy();
+    expect(
+      row(tables, "research_user_profiles", "research-profile-user"),
+    ).toBeUndefined();
+    expect(
+      row(tables, "research_user_profiles", "research-profile-other"),
+    ).toBeTruthy();
+    expect(
+      row(tables, "research_run_members", "research-member-user"),
+    ).toBeUndefined();
+    expect(
+      row(tables, "research_run_members", "research-member-other"),
+    ).toBeTruthy();
+    expect(row(tables, "research_runs", "research-run")).toBeTruthy();
+    expect(row(tables, "research_reports", "research-report")).toBeTruthy();
+    expect(row(tables, "user_deletion_fences", "fence-user")).toBeTruthy();
+    expect(
+      row(tables, "subagent_events", "subagent-event-user"),
+    ).toBeUndefined();
+    expect(row(tables, "subagent_events", "subagent-event-other")).toBeTruthy();
+    expect(
+      row(tables, "subagent_work_items", "subagent-work-user"),
+    ).toBeUndefined();
+    expect(
+      row(tables, "subagent_work_items", "subagent-work-other"),
+    ).toBeTruthy();
 
     expect(row(tables, "cancellation_reasons", "cancel-user")).toMatchObject({
       user_id: DELETED_USER_ID,
@@ -555,10 +774,24 @@ describe("userDeletion", () => {
     expect(
       row(tables, "cancellation_reasons", "cancel-user")?.reason_details_id,
     ).toBeUndefined();
+    expect(row(tables, "involuntary_churn_events", "churn-user")).toMatchObject(
+      {
+        user_id: DELETED_USER_ID,
+        idempotency_key: "evt-user:__deleted_user__:churn-user",
+        stripe_event_id: "evt-user",
+        stripe_invoice_id: "in-user",
+      },
+    );
+    expect(
+      row(tables, "involuntary_churn_events", "churn-other"),
+    ).toMatchObject({ user_id: "user_other" });
     expect(row(tables, "usage_logs", "usage-user")).toMatchObject({
       user_id: DELETED_USER_ID,
     });
     expect(row(tables, "usage_logs", "usage-user")?.chat_id).toBeUndefined();
+    expect(
+      row(tables, "usage_logs", "usage-user")?.assistant_message_id,
+    ).toBeUndefined();
     expect(row(tables, "referral_codes", "ref-code-user")).toMatchObject({
       user_id: DELETED_USER_ID,
       status: "deactivated",
@@ -617,7 +850,9 @@ describe("userDeletion", () => {
     });
 
     for (const table of USER_DELETION_TABLE_POLICY.retain) {
-      expect(tables[table]).toHaveLength(1);
+      expect(tables[table]).toHaveLength(
+        table === "user_deletion_fences" ? 2 : 1,
+      );
     }
 
     expect(mockFileCountAggregate.deleteIfExists).toHaveBeenCalledWith(
@@ -626,8 +861,8 @@ describe("userDeletion", () => {
     );
     expect(scheduler.runAfter).toHaveBeenCalledWith(
       0,
-      "deleteS3ObjectsBatchAction",
-      { s3Keys: ["users/user_123/file.pdf"] },
+      "deleteTrackedS3Object",
+      { deletionId: expect.any(String) },
     );
 
     expect(deletedIds.indexOf("feedback-user")).toBeLessThan(
@@ -635,6 +870,12 @@ describe("userDeletion", () => {
     );
     expect(deletedIds.indexOf("summary-by-chat")).toBeLessThan(
       deletedIds.indexOf("chat-doc"),
+    );
+    expect(deletedIds.indexOf("subagent-event-user")).toBeLessThan(
+      deletedIds.indexOf("subagent-run-user"),
+    );
+    expect(deletedIds.indexOf("subagent-work-user")).toBeLessThan(
+      deletedIds.indexOf("subagent-run-user"),
     );
   });
 
@@ -649,6 +890,196 @@ describe("userDeletion", () => {
     });
 
     expect(row(tables, "chats", "chat-doc")).toBeUndefined();
+  });
+
+  it("keeps cleanup fenced while a subscription resume is in flight", async () => {
+    const { deleteAllUserDataByService } = await import("../userDeletion");
+    const tables: Tables = {
+      subscription_pauses: [
+        {
+          _id: "pause-resuming",
+          user_id: "user_123",
+          status: "resuming",
+          requested_at: 1,
+        },
+      ],
+    };
+    const { ctx } = createMockCtx(tables);
+
+    const activeCleanup = await deleteAllUserDataByService.handler(ctx as any, {
+      serviceKey: "service_key",
+      userId: "user_123",
+    });
+    expect(activeCleanup.hasMore).toBe(true);
+    expect(row(tables, "subscription_pauses", "pause-resuming")).toBeTruthy();
+
+    tables.subscription_pauses[0].status = "resumed";
+    const settledCleanup = await deleteAllUserDataByService.handler(
+      ctx as any,
+      { serviceKey: "service_key", userId: "user_123" },
+    );
+    expect(settledCleanup.hasMore).toBe(false);
+    expect(
+      row(tables, "subscription_pauses", "pause-resuming"),
+    ).toBeUndefined();
+  });
+
+  it("deletes every non-running subscription pause lifecycle state", async () => {
+    const { deleteAllUserDataByService } = await import("../userDeletion");
+    const statuses = [
+      "scheduled",
+      "paused",
+      "resume_failed",
+      "resumed",
+      "canceled",
+      "superseded",
+    ];
+    const tables: Tables = {
+      subscription_pauses: statuses.map((status) => ({
+        _id: `pause-${status}`,
+        user_id: "user_123",
+        status,
+        requested_at: 1,
+      })),
+    };
+    const { ctx } = createMockCtx(tables);
+
+    const cleanup = await deleteAllUserDataByService.handler(ctx as any, {
+      serviceKey: "service_key",
+      userId: "user_123",
+    });
+
+    expect(cleanup.hasMore).toBe(false);
+    expect(tables.subscription_pauses).toHaveLength(0);
+  });
+
+  it("anonymizes a shared-organization pause without removing its resume schedule", async () => {
+    const { deleteAllUserDataByService, DELETED_USER_ID } =
+      await import("../userDeletion");
+    const tables: Tables = {
+      subscription_pauses: [
+        {
+          _id: "pause-shared",
+          user_id: "user_123",
+          organization_id: "org_shared",
+          status: "scheduled",
+          requested_at: 1,
+          updated_at: 1,
+        },
+      ],
+    };
+    const { ctx } = createMockCtx(tables);
+
+    const cleanup = await deleteAllUserDataByService.handler(ctx as any, {
+      serviceKey: "service_key",
+      userId: "user_123",
+      preservedOrganizationIds: ["org_shared"],
+    });
+
+    expect(cleanup.hasMore).toBe(false);
+    expect(row(tables, "subscription_pauses", "pause-shared")).toMatchObject({
+      user_id: DELETED_USER_ID,
+      organization_id: "org_shared",
+      status: "scheduled",
+    });
+  });
+
+  it("creates an idempotent deletion fence before lifecycle cleanup", async () => {
+    const { beginUserDataDeletionByService } = await import("../userDeletion");
+    const tables = seedTables();
+    tables.user_deletion_fences = [];
+    const { ctx, db } = createMockCtx(tables);
+
+    const first = await beginUserDataDeletionByService.handler(ctx as any, {
+      serviceKey: "service_key",
+      userId: "user_123",
+    });
+    const second = await beginUserDataDeletionByService.handler(ctx as any, {
+      serviceKey: "service_key",
+      userId: "user_123",
+    });
+
+    expect(first).toBe(true);
+    expect(second).toBe(true);
+    expect(tables.user_deletion_fences).toHaveLength(1);
+    expect(tables.user_deletion_fences[0]).toMatchObject({
+      user_id: "user_123",
+      started_at: expect.any(Number),
+    });
+    expect(db.insert).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels an unapproved resume claim in the deletion-fence transaction", async () => {
+    const { beginUserDataDeletionByService } = await import("../userDeletion");
+    const tables = seedTables();
+    tables.user_deletion_fences = [];
+    tables.subscription_pauses[0] = {
+      ...tables.subscription_pauses[0],
+      status: "resuming",
+      resume_claimed_at: 5_000,
+      resume_claim_version: 2,
+      resume_attempt_count: 1,
+    };
+    const { ctx } = createMockCtx(tables);
+
+    const started = await beginUserDataDeletionByService.handler(ctx as any, {
+      serviceKey: "service_key",
+      userId: "user_123",
+    });
+
+    expect(started).toBe(true);
+    expect(tables.subscription_pauses[0]).toMatchObject({
+      status: "canceled",
+      canceled_at: expect.any(Number),
+    });
+    expect(tables.subscription_pauses[0].resume_claimed_at).toBeUndefined();
+    expect(tables.subscription_pauses[0].resume_claim_version).toBeUndefined();
+    expect(tables.user_deletion_fences).toHaveLength(1);
+  });
+
+  it("waits for an authorized Stripe resume before inserting the deletion fence", async () => {
+    const { beginUserDataDeletionByService } = await import("../userDeletion");
+    const tables = seedTables();
+    tables.user_deletion_fences = [];
+    tables.subscription_pauses[0] = {
+      ...tables.subscription_pauses[0],
+      status: "resuming",
+      resume_claimed_at: 5_000,
+      resume_claim_version: 2,
+      resume_side_effect_authorized_at: 5_001,
+      resume_attempt_count: 1,
+    };
+    const { ctx } = createMockCtx(tables);
+
+    const started = await beginUserDataDeletionByService.handler(ctx as any, {
+      serviceKey: "service_key",
+      userId: "user_123",
+    });
+
+    expect(started).toBe(false);
+    expect(tables.subscription_pauses[0].status).toBe("resuming");
+    expect(tables.user_deletion_fences).toHaveLength(0);
+  });
+
+  it("fails closed for a rolling-deployment resume claim", async () => {
+    const { beginUserDataDeletionByService } = await import("../userDeletion");
+    const tables = seedTables();
+    tables.user_deletion_fences = [];
+    tables.subscription_pauses[0] = {
+      ...tables.subscription_pauses[0],
+      status: "resuming",
+      resume_claimed_at: 5_000,
+      resume_attempt_count: 1,
+    };
+    const { ctx } = createMockCtx(tables);
+
+    const started = await beginUserDataDeletionByService.handler(ctx as any, {
+      serviceKey: "service_key",
+      userId: "user_123",
+    });
+
+    expect(started).toBe(false);
+    expect(tables.user_deletion_fences).toHaveLength(0);
   });
 
   it("rejects service-key cleanup with an invalid key", async () => {
@@ -712,6 +1143,62 @@ describe("userDeletion", () => {
     expect(row(tables, "chat_summaries", "summary-other")).toBeTruthy();
   });
 
+  it("dry-runs and executes orphan subagent residue cleanup", async () => {
+    const { cleanupDeletedUserResidue } = await import("../userDeletion");
+    const tables = seedTables();
+    tables.subagent_events.push({
+      _id: "subagent-event-orphan",
+      subagent_id: "sa-missing",
+      user_id: "deleted-user",
+    });
+    tables.subagent_work_items.push({
+      _id: "subagent-work-orphan",
+      subagent_id: "sa-missing",
+      user_id: "deleted-user",
+    });
+    const { ctx } = createMockCtx(tables);
+
+    const dryRun = await cleanupDeletedUserResidue.handler(ctx as any, {
+      serviceKey: "service_key",
+      orphanSubagentTable: "subagent_events",
+      orphanNumItems: 100,
+    });
+
+    expect(dryRun.hasMore).toBe(false);
+    expect(dryRun.orphanSubagentRowsTable).toBe("subagent_events");
+    expect(dryRun.orphanSubagentRowsScanned).toBe(3);
+    expect(dryRun.orphanSubagentRowsDeleted).toBe(1);
+    expect(
+      row(tables, "subagent_events", "subagent-event-orphan"),
+    ).toBeTruthy();
+
+    const eventExecute = await cleanupDeletedUserResidue.handler(ctx as any, {
+      serviceKey: "service_key",
+      orphanSubagentTable: "subagent_events",
+      dryRun: false,
+      orphanNumItems: 100,
+    });
+    const workExecute = await cleanupDeletedUserResidue.handler(ctx as any, {
+      serviceKey: "service_key",
+      orphanSubagentTable: "subagent_work_items",
+      dryRun: false,
+      orphanNumItems: 100,
+    });
+
+    expect(eventExecute.orphanSubagentRowsDeleted).toBe(1);
+    expect(workExecute.orphanSubagentRowsDeleted).toBe(1);
+    expect(
+      row(tables, "subagent_events", "subagent-event-orphan"),
+    ).toBeUndefined();
+    expect(
+      row(tables, "subagent_work_items", "subagent-work-orphan"),
+    ).toBeUndefined();
+    expect(row(tables, "subagent_events", "subagent-event-user")).toBeTruthy();
+    expect(
+      row(tables, "subagent_work_items", "subagent-work-other"),
+    ).toBeTruthy();
+  });
+
   it("rejects bulk deleted-user residue cleanup in one transaction", async () => {
     const { cleanupDeletedUserResidue } = await import("../userDeletion");
     const tables = seedTables();
@@ -740,7 +1227,7 @@ describe("userDeletion", () => {
   });
 
   it("keeps cleanup reads bounded and preserves chats until a later message batch", async () => {
-    const { deleteAllUserData } = await import("../userDeletion");
+    const { deleteAllUserDataByService } = await import("../userDeletion");
     const tables = seedTables();
     tables.feedback = Array.from({ length: 101 }, (_, index) => ({
       _id: `feedback-user-${index}`,
@@ -758,7 +1245,10 @@ describe("userDeletion", () => {
     }));
     const { ctx, readCounter } = createMockCtx(tables);
 
-    const firstBatch = await deleteAllUserData.handler(ctx as any, {});
+    const firstBatch = await deleteAllUserDataByService.handler(ctx as any, {
+      serviceKey: "service_key",
+      userId: "user_123",
+    });
     const firstBatchReads = readCounter.value;
 
     expect(firstBatch.hasMore).toBe(true);
@@ -769,7 +1259,10 @@ describe("userDeletion", () => {
     expect(firstBatchReads).toBeLessThanOrEqual(100);
     expect(row(tables, "chats", "chat-doc")).toBeTruthy();
 
-    const secondBatch = await deleteAllUserData.handler(ctx as any, {});
+    const secondBatch = await deleteAllUserDataByService.handler(ctx as any, {
+      serviceKey: "service_key",
+      userId: "user_123",
+    });
     const secondBatchReads = readCounter.value - firstBatchReads;
 
     expect(secondBatch.hasMore).toBe(true);
@@ -780,7 +1273,10 @@ describe("userDeletion", () => {
     expect(secondBatchReads).toBeLessThanOrEqual(100);
     expect(row(tables, "chats", "chat-doc")).toBeTruthy();
 
-    const thirdBatch = await deleteAllUserData.handler(ctx as any, {});
+    const thirdBatch = await deleteAllUserDataByService.handler(ctx as any, {
+      serviceKey: "service_key",
+      userId: "user_123",
+    });
     const thirdBatchReads =
       readCounter.value - firstBatchReads - secondBatchReads;
 
@@ -793,21 +1289,207 @@ describe("userDeletion", () => {
     expect(row(tables, "chats", "chat-doc")).toBeUndefined();
   });
 
+  it.each(["service", "residue"])(
+    "bounds aggregate bytes and finishes large records through %s cleanup",
+    async (entry) => {
+      const { deleteAllUserDataByService, cleanupDeletedUserResidue } =
+        await import("../userDeletion");
+      const payload = "x".repeat(900 * 1024);
+      const tables: Tables = {
+        messages: Array.from({ length: 24 }, (_, i) => ({
+          _id: `m${i}`,
+          user_id: "user_123",
+          chat_id: "chat",
+          parts: [{ text: payload }],
+          feedback_id: `f${i}`,
+        })),
+        feedback: Array.from({ length: 24 }, (_, i) => ({
+          _id: `f${i}`,
+          feedback_details: payload,
+        })),
+        chats: [
+          {
+            _id: "chat",
+            id: "chat",
+            user_id: "user_123",
+            latest_summary_id: "legacy",
+            title: payload,
+          },
+        ],
+        chat_summaries: [
+          { _id: "summary", chat_id: "chat", summary_text: payload },
+          { _id: "legacy", chat_id: "legacy", summary_text: payload },
+        ],
+        subagent_messages: Array.from({ length: 6 }, (_, i) => ({
+          _id: `sm${i}`,
+          user_id: "user_123",
+          parts: [{ text: payload }],
+        })),
+        subagent_runs: [
+          { _id: "run", user_id: "user_123", objective: payload },
+        ],
+        notes: Array.from({ length: 6 }, (_, i) => ({
+          _id: `n${i}`,
+          user_id: "user_123",
+          content: payload,
+        })),
+        usage_logs: Array.from({ length: 6 }, (_, i) => ({
+          _id: `u${i}`,
+          user_id: "user_123",
+          content: payload,
+        })),
+      };
+      const { ctx, readCounter, deletedIds } = createMockCtx(tables);
+      let completed = false;
+      let passes = 0;
+      while (!completed && passes < 50) {
+        readCounter.bytes = 0;
+        const before = deletedIds.length;
+        const result =
+          entry === "service"
+            ? await deleteAllUserDataByService.handler(ctx as any, {
+                serviceKey: "service_key",
+                userId: "user_123",
+              })
+            : await cleanupDeletedUserResidue.handler(ctx as any, {
+                serviceKey: "service_key",
+                userIds: ["user_123"],
+                dryRun: false,
+              });
+        expect(readCounter.bytes).toBeLessThan(16 * 1024 * 1024);
+        for (const feedback of tables.feedback) {
+          expect(
+            tables.messages.some(
+              (message) => message.feedback_id === feedback._id,
+            ),
+          ).toBe(true);
+        }
+        if (
+          tables.messages.length ||
+          tables.subagent_messages.length ||
+          tables.subagent_runs.length
+        )
+          expect(tables.chats).toHaveLength(1);
+        expect(
+          deletedIds.length > before ||
+            Object.values(result.anonymized).some((n) => Number(n) > 0) ||
+            !result.hasMore,
+        ).toBe(true);
+        completed = !result.hasMore;
+        passes += 1;
+      }
+      expect(completed).toBe(true);
+      expect(passes).toBeGreaterThan(1);
+      for (const table of [
+        "messages",
+        "feedback",
+        "chats",
+        "chat_summaries",
+        "subagent_messages",
+        "subagent_runs",
+        "notes",
+      ])
+        expect(tables[table]).toHaveLength(0);
+      expect(tables.usage_logs.every((row) => row.user_id !== "user_123")).toBe(
+        true,
+      );
+    },
+  );
+
+  it.each(["chat_summaries", "subagent_events", "subagent_work_items"])(
+    "bounds orphan %s parent reads and preserves pagination",
+    async (table) => {
+      const { cleanupDeletedUserResidue } = await import("../userDeletion");
+      const payload = "x".repeat(900 * 1024);
+      const tables: Tables = {
+        [table]: Array.from({ length: 12 }, (_, i) => ({
+          _id: `row${i}`,
+          chat_id: `c${i}`,
+          subagent_id: `s${i}`,
+          content: payload,
+        })),
+        chats: Array.from({ length: 12 }, (_, i) => ({
+          _id: `c${i}`,
+          id: `c${i}`,
+          title: payload,
+        })),
+        subagent_runs: Array.from({ length: 12 }, (_, i) => ({
+          _id: `s${i}`,
+          subagent_id: `s${i}`,
+          objective: payload,
+        })),
+      };
+      const { ctx, readCounter } = createMockCtx(tables);
+      let cursor: string | undefined;
+      let scanned = 0;
+      for (let i = 0; i < 3; i++) {
+        readCounter.bytes = 0;
+        const result = await cleanupDeletedUserResidue.handler(ctx as any, {
+          serviceKey: "service_key",
+          ...(table === "chat_summaries"
+            ? { deleteOrphanChatSummaries: true }
+            : { orphanSubagentTable: table }),
+          orphanNumItems: 1000,
+          orphanCursor: cursor,
+        });
+        expect(readCounter.bytes).toBeLessThan(16 * 1024 * 1024);
+        scanned +=
+          table === "chat_summaries"
+            ? result.orphanChatSummariesScanned
+            : result.orphanSubagentRowsScanned;
+        cursor =
+          table === "chat_summaries"
+            ? result.orphanChatSummariesContinueCursor
+            : result.orphanSubagentRowsContinueCursor;
+        expect(result.hasMore).toBe(i < 2);
+      }
+      expect(scanned).toBe(12);
+      expect(tables[table]).toHaveLength(12);
+    },
+  );
+
+  it("rejects combining both orphan passes in one transaction", async () => {
+    const { cleanupDeletedUserResidue } = await import("../userDeletion");
+    const { ctx } = createMockCtx(seedTables());
+    await expect(
+      cleanupDeletedUserResidue.handler(ctx as any, {
+        serviceKey: "service_key",
+        deleteOrphanChatSummaries: true,
+        orphanSubagentTable: "subagent_events",
+      }),
+    ).rejects.toThrow("separate mutation");
+  });
+
   it("fails user deletion if S3 cleanup scheduling fails", async () => {
-    const { deleteAllUserData } = await import("../userDeletion");
+    const { deleteAllUserDataByService } = await import("../userDeletion");
     const tables = seedTables();
     const { ctx, scheduler } = createMockCtx(tables);
     scheduler.runAfter.mockRejectedValueOnce(new Error("Scheduler error"));
 
-    await expect(deleteAllUserData.handler(ctx as any, {})).rejects.toThrow(
-      "Scheduler error",
-    );
+    await expect(
+      deleteAllUserDataByService.handler(ctx as any, {
+        serviceKey: "service_key",
+        userId: "user_123",
+      }),
+    ).rejects.toThrow("Scheduler error");
 
     expect(scheduler.runAfter).toHaveBeenCalledWith(
       0,
-      "deleteS3ObjectsBatchAction",
-      { s3Keys: ["users/user_123/file.pdf"] },
+      "deleteTrackedS3Object",
+      { deletionId: expect.any(String) },
     );
+  });
+
+  it("blocks authenticated clients from bypassing lifecycle-aware account deletion", async () => {
+    const { deleteAllUserData } = await import("../userDeletion");
+    const tables = seedTables();
+    const { ctx } = createMockCtx(tables);
+
+    await expect(deleteAllUserData.handler(ctx as any, {})).rejects.toThrow(
+      "use the secure account deletion endpoint",
+    );
+
+    expect(row(tables, "chats", "chat-doc")).toBeTruthy();
   });
 
   it("throws if the public mutation has no authenticated user", async () => {

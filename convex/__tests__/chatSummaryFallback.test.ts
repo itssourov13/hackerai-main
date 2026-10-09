@@ -50,7 +50,7 @@ jest.mock("../chats", () => ({
 }));
 jest.mock("../lib/suspensionGuards", () => ({
   assertUserCanAccessChatHistory: jest.fn<any>().mockResolvedValue(undefined),
-  isUserBlockedByActiveFraudDispute: jest.fn<any>().mockResolvedValue(false),
+  isUserBlockedFromChatHistory: jest.fn<any>().mockResolvedValue(false),
   CHAT_ACCESS_SUSPENDED_CODE: "CHAT_ACCESS_SUSPENDED",
 }));
 
@@ -301,6 +301,13 @@ describe("saveLatestSummary — previous_summaries chain", () => {
     let messageQueryCount = 0;
 
     mockCtx.db.query.mockImplementation((table: string) => {
+      if (table === "model_history") {
+        return {
+          withIndex: jest.fn().mockReturnValue({
+            unique: jest.fn<any>().mockResolvedValue(null),
+          }),
+        };
+      }
       if (table === "chats") {
         return {
           withIndex: jest.fn().mockReturnValue({
@@ -392,6 +399,59 @@ describe("saveLatestSummary — previous_summaries chain", () => {
 
     const insertedDoc = mockCtx.db.insert.mock.calls[0][1];
     expectNoSummaryTelemetry(insertedDoc);
+  });
+
+  it("attaches a completed transcript to the matching latest summary", async () => {
+    const chat = makeChatDoc();
+    const summary = makeSummaryDoc();
+    mockCtx.db.query.mockReturnValue({
+      withIndex: jest.fn().mockReturnValue({
+        first: jest.fn<any>().mockResolvedValue(chat),
+      }),
+    });
+    mockCtx.db.get.mockResolvedValue(summary);
+    const { attachLatestSummaryTranscript } = await import("../chats");
+
+    const attached = await attachLatestSummaryTranscript.handler(mockCtx, {
+      serviceKey: SERVICE_KEY,
+      chatId: CHAT_ID,
+      summaryUpToMessageId: "msg-cutoff",
+      summaryText:
+        "current summary\n\nTranscript location: /tmp/transcript.json",
+      transcriptPath: "/tmp/transcript.json",
+    });
+
+    expect(attached).toBe(true);
+    expect(mockCtx.db.patch).toHaveBeenCalledWith(SUMMARY_DOC_ID, {
+      summary_text:
+        "current summary\n\nTranscript location: /tmp/transcript.json",
+      transcript_path: "/tmp/transcript.json",
+    });
+  });
+
+  it("does not attach a late transcript after a newer summary wins", async () => {
+    const chat = makeChatDoc();
+    const summary = makeSummaryDoc({
+      summary_up_to_message_id: "msg-newer-cutoff",
+    });
+    mockCtx.db.query.mockReturnValue({
+      withIndex: jest.fn().mockReturnValue({
+        first: jest.fn<any>().mockResolvedValue(chat),
+      }),
+    });
+    mockCtx.db.get.mockResolvedValue(summary);
+    const { attachLatestSummaryTranscript } = await import("../chats");
+
+    const attached = await attachLatestSummaryTranscript.handler(mockCtx, {
+      serviceKey: SERVICE_KEY,
+      chatId: CHAT_ID,
+      summaryUpToMessageId: "msg-old-cutoff",
+      summaryText: "stale summary with transcript",
+      transcriptPath: "/tmp/stale-transcript.json",
+    });
+
+    expect(attached).toBe(false);
+    expect(mockCtx.db.patch).not.toHaveBeenCalled();
   });
 
   it("should remove legacy summary telemetry fields in cleanup batches", async () => {
@@ -950,7 +1010,7 @@ describe("checkAndInvalidateSummary via deleteLastAssistantMessage", () => {
   /**
    * Sets up the chained mock for ctx.db.query so that different tables/indexes
    * return different results. Call order within deleteLastAssistantMessage:
-   *   1. messages.by_chat_id (with filter+order+first) -> last assistant msg
+   *   1. messages.by_chat_id (descending iterator) -> trailing response chain
    *   2. chats.by_chat_id (first) -> chat doc              [inside checkAndInvalidateSummary]
    *   3. messages.by_message_id (first) -> cutoff message   [inside checkAndInvalidateSummary]
    *   4. possibly more messages.by_message_id calls         [inside tryFallbackSummary]
@@ -961,6 +1021,7 @@ describe("checkAndInvalidateSummary via deleteLastAssistantMessage", () => {
     chatDoc: Record<string, any> | null;
     cutoffMessage: Record<string, any> | null;
     fallbackCutoffMessages?: (Record<string, any> | null)[];
+    trailingMessages?: AsyncIterable<Record<string, any>>;
   }): void {
     let callIndex = 0;
     const {
@@ -971,15 +1032,24 @@ describe("checkAndInvalidateSummary via deleteLastAssistantMessage", () => {
     } = config;
 
     mockCtx.db.query.mockImplementation((table: string) => {
+      if (table === "model_history") {
+        return {
+          withIndex: jest.fn().mockReturnValue({
+            unique: jest.fn<any>().mockResolvedValue(null),
+          }),
+        };
+      }
       const currentCall = callIndex++;
 
       if (currentCall === 0 && table === "messages") {
-        // deleteLastAssistantMessage now fetches all messages desc to walk back the chain
+        // Regeneration reads only the trailing response chain via an iterator.
         const allMessages = assistantMessage ? [assistantMessage] : [];
         return {
           withIndex: jest.fn().mockReturnValue({
             order: jest.fn().mockReturnValue({
-              collect: jest.fn<any>().mockResolvedValue(allMessages),
+              async *[Symbol.asyncIterator]() {
+                yield* config.trailingMessages ?? allMessages;
+              },
             }),
           }),
         };
@@ -1023,6 +1093,36 @@ describe("checkAndInvalidateSummary via deleteLastAssistantMessage", () => {
       };
     });
   }
+
+  it("stops reading a 10,000-message history at the visible request while deleting hidden continuations", async () => {
+    let reads = 0;
+    setupDbQueryChain({
+      assistantMessage: null,
+      chatDoc: makeChatDoc({ latest_summary_id: undefined }),
+      cutoffMessage: null,
+      trailingMessages: {
+        async *[Symbol.asyncIterator]() {
+          for (let i = 0; i < 10_000; i++) {
+            reads++;
+            yield makeAssistantMessage({
+              _id: `doc-${i}`,
+              id: `msg-${i}`,
+              role: i === 1 || i >= 3 ? "user" : "assistant",
+              is_hidden: i === 1,
+            });
+          }
+        },
+      },
+    });
+    const { deleteLastAssistantMessage } = await import("../messages");
+    await deleteLastAssistantMessage.handler(mockCtx, { chatId: CHAT_ID });
+    expect(reads).toBe(4);
+    expect(mockCtx.db.delete.mock.calls).toEqual([
+      ["doc-0"],
+      ["doc-1"],
+      ["doc-2"],
+    ]);
+  });
 
   it("should NOT invalidate when deleted message is newer than cutoff", async () => {
     const assistantMsg = makeAssistantMessage({ _creationTime: 5000 });
@@ -1093,11 +1193,20 @@ describe("checkAndInvalidateSummary via deleteLastAssistantMessage", () => {
     const latestSummary = makeSummaryDoc();
 
     mockCtx.db.query.mockImplementation((table: string) => {
+      if (table === "model_history") {
+        return {
+          withIndex: jest.fn().mockReturnValue({
+            unique: jest.fn<any>().mockResolvedValue(null),
+          }),
+        };
+      }
       if (table === "messages") {
         return {
           withIndex: jest.fn().mockReturnValue({
             order: jest.fn().mockReturnValue({
-              collect: jest.fn<any>().mockResolvedValue([assistantMsg]),
+              async *[Symbol.asyncIterator]() {
+                yield assistantMsg;
+              },
             }),
           }),
         };
@@ -1483,7 +1592,7 @@ describe("regenerateWithNewContent feedback cleanup", () => {
     };
   });
 
-  it("should delete feedback for later messages removed by edit-regenerate", async () => {
+  it("should delete feedback and replace todos for later messages removed by edit-regenerate", async () => {
     const editedUserMessage = {
       _id: "user-doc-1" as Id<"messages">,
       id: "user-msg-1",
@@ -1509,6 +1618,13 @@ describe("regenerateWithNewContent feedback cleanup", () => {
     const chatDoc = makeChatDoc({ latest_summary_id: undefined });
 
     mockCtx.db.query.mockImplementation((table: string) => {
+      if (table === "model_history") {
+        return {
+          withIndex: jest.fn().mockReturnValue({
+            unique: jest.fn<any>().mockResolvedValue(null),
+          }),
+        };
+      }
       if (table === "messages") {
         return {
           withIndex: jest.fn((indexName: string) => {
@@ -1545,6 +1661,7 @@ describe("regenerateWithNewContent feedback cleanup", () => {
     await regenerateWithNewContent.handler(mockCtx, {
       messageId: editedUserMessage.id,
       newContent: "new prompt",
+      todos: [],
     });
 
     const deleteArgs = mockCtx.db.delete.mock.calls.map(
@@ -1555,6 +1672,139 @@ describe("regenerateWithNewContent feedback cleanup", () => {
     expect(deleteArgs.indexOf("feedback-2")).toBeLessThan(
       deleteArgs.indexOf(laterAssistantMessage._id),
     );
+    expect(mockCtx.db.patch).toHaveBeenCalledWith(
+      CHAT_DOC_ID,
+      expect.objectContaining({ todos: [], update_time: expect.any(Number) }),
+    );
+  });
+
+  it("should reject editing a user message when a newer visible user message exists", async () => {
+    const editedUserMessage = {
+      _id: "user-doc-1" as Id<"messages">,
+      id: "user-msg-1",
+      chat_id: CHAT_ID,
+      user_id: USER_ID,
+      role: "user",
+      parts: [{ type: "text", text: "old prompt" }],
+      content: "old prompt",
+      _creationTime: 1000,
+      file_ids: undefined,
+    };
+    const laterUserMessage = {
+      _id: "user-doc-2" as Id<"messages">,
+      id: "user-msg-2",
+      chat_id: CHAT_ID,
+      user_id: USER_ID,
+      role: "user",
+      parts: [{ type: "text", text: "newer prompt" }],
+      content: "newer prompt",
+      _creationTime: 3000,
+      file_ids: undefined,
+      is_hidden: undefined,
+    };
+
+    mockCtx.db.query.mockImplementation((table: string) => {
+      if (table === "model_history") {
+        return {
+          withIndex: jest.fn().mockReturnValue({
+            unique: jest.fn<any>().mockResolvedValue(null),
+          }),
+        };
+      }
+      if (table !== "messages") {
+        throw new Error(`Unexpected table ${table}`);
+      }
+
+      return {
+        withIndex: jest.fn((indexName: string) => {
+          if (indexName === "by_message_id") {
+            return {
+              first: jest.fn<any>().mockResolvedValue(editedUserMessage),
+            };
+          }
+          if (indexName === "by_chat_id") {
+            return {
+              collect: jest.fn<any>().mockResolvedValue([laterUserMessage]),
+            };
+          }
+          throw new Error(`Unexpected messages index ${indexName}`);
+        }),
+      };
+    });
+
+    const { regenerateWithNewContent } = await import("../messages");
+
+    await expect(
+      regenerateWithNewContent.handler(mockCtx, {
+        messageId: editedUserMessage.id,
+        newContent: "edited prompt",
+      }),
+    ).rejects.toMatchObject({
+      data: expect.objectContaining({
+        code: "MESSAGE_NOT_EDITABLE",
+      }),
+    });
+    expect(mockCtx.db.patch).not.toHaveBeenCalled();
+    expect(mockCtx.db.delete).not.toHaveBeenCalled();
+  });
+
+  it("should reject editing a hidden auto-continue user message", async () => {
+    const hiddenUserMessage = {
+      _id: "hidden-user-doc" as Id<"messages">,
+      id: "hidden-user-msg",
+      chat_id: CHAT_ID,
+      user_id: USER_ID,
+      role: "user",
+      parts: [{ type: "text", text: "Continue from where you left off." }],
+      content: "Continue from where you left off.",
+      _creationTime: 3000,
+      file_ids: undefined,
+      is_hidden: true,
+    };
+
+    mockCtx.db.query.mockImplementation((table: string) => {
+      if (table === "model_history") {
+        return {
+          withIndex: jest.fn().mockReturnValue({
+            unique: jest.fn<any>().mockResolvedValue(null),
+          }),
+        };
+      }
+      if (table !== "messages") {
+        throw new Error(`Unexpected table ${table}`);
+      }
+
+      return {
+        withIndex: jest.fn((indexName: string) => {
+          if (indexName === "by_message_id") {
+            return {
+              first: jest.fn<any>().mockResolvedValue(hiddenUserMessage),
+            };
+          }
+          if (indexName === "by_chat_id") {
+            return {
+              collect: jest.fn<any>().mockResolvedValue([]),
+            };
+          }
+          throw new Error(`Unexpected messages index ${indexName}`);
+        }),
+      };
+    });
+
+    const { regenerateWithNewContent } = await import("../messages");
+
+    await expect(
+      regenerateWithNewContent.handler(mockCtx, {
+        messageId: hiddenUserMessage.id,
+        newContent: "edited hidden prompt",
+      }),
+    ).rejects.toMatchObject({
+      data: expect.objectContaining({
+        code: "MESSAGE_NOT_EDITABLE",
+      }),
+    });
+    expect(mockCtx.db.patch).not.toHaveBeenCalled();
+    expect(mockCtx.db.delete).not.toHaveBeenCalled();
   });
 
   it("should clear stale summaries when the edited message is covered by the latest summary", async () => {
@@ -1587,6 +1837,13 @@ describe("regenerateWithNewContent feedback cleanup", () => {
     });
 
     mockCtx.db.query.mockImplementation((table: string) => {
+      if (table === "model_history") {
+        return {
+          withIndex: jest.fn().mockReturnValue({
+            unique: jest.fn<any>().mockResolvedValue(null),
+          }),
+        };
+      }
       if (table === "messages") {
         return {
           withIndex: jest.fn((indexName: string) => {

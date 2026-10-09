@@ -9,7 +9,7 @@ import type {
 const MIB = 1024 * 1024;
 
 const providerRequest: ProviderRequestDiagnostics = {
-  model: "model-grok-4.5",
+  model: "model-grok-4.6",
   requested_model_slug: "agent-model",
   step_index: 3,
   source: "prepare_step",
@@ -153,6 +153,58 @@ describe("AgentLongMemoryTelemetry", () => {
     expect(emit.mock.calls[1]?.[0]).toMatchObject({
       checkpoint_reason: "interval",
     });
+  });
+
+  it("emits bounded periodic checkpoints during long provider work", () => {
+    jest.useFakeTimers();
+    try {
+      let now = 0;
+      const emit = jest.fn();
+      const telemetry = new AgentLongMemoryTelemetry({
+        runId: "run_123",
+        chatId: "chat_123",
+        userId: "user_123",
+        emit,
+        now: () => now,
+        readMemory: () => ({
+          rss: 220 * MIB,
+          heapTotal: 180 * MIB,
+          heapUsed: 110 * MIB,
+          external: 0,
+          arrayBuffers: 0,
+        }),
+        readHeapLimit: () => 416 * MIB,
+      });
+
+      now = 30 * 1_000;
+      telemetry.checkpoint({
+        phase: "provider_request",
+        providerRequest,
+        retention,
+      });
+      telemetry.startPeriodicCheckpoints();
+      now += 2 * 60 * 1_000 - 1;
+      jest.advanceTimersByTime(2 * 60 * 1_000 - 1);
+      expect(emit).toHaveBeenCalledTimes(1);
+
+      now += 1;
+      jest.advanceTimersByTime(1);
+
+      expect(emit).toHaveBeenCalledTimes(2);
+      expect(emit.mock.calls[1]?.[0]).toMatchObject({
+        checkpoint_reason: "periodic",
+        phase: "provider_request",
+        provider_request: providerRequest,
+        retention,
+      });
+
+      telemetry.dispose();
+      now += 2 * 60 * 1_000;
+      jest.advanceTimersByTime(2 * 60 * 1_000);
+      expect(emit).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it("forces a failure checkpoint and keeps prior high-water values", () => {

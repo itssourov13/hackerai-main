@@ -3,6 +3,8 @@ import { describe, expect, it, jest, beforeEach } from "@jest/globals";
 const mockCreateBillingPortalSession = jest.fn();
 const mockGetBillingActionContext = jest.fn();
 const mockPostHogError = jest.fn();
+const mockPostHogEvent = jest.fn();
+const mockAssertUserCanStartBillingTransaction = jest.fn();
 
 jest.mock("@/app/api/stripe", () => ({
   stripe: {
@@ -18,9 +20,15 @@ jest.mock("@/lib/actions/billing-context", () => ({
   getBillingActionContext: mockGetBillingActionContext,
 }));
 
+jest.mock("@/lib/suspensions", () => ({
+  assertUserCanStartBillingTransaction:
+    mockAssertUserCanStartBillingTransaction,
+}));
+
 jest.mock("@/lib/posthog/server", () => ({
   phLogger: {
     error: mockPostHogError,
+    event: mockPostHogEvent,
   },
 }));
 
@@ -33,6 +41,7 @@ describe("redirectToBillingPortal", () => {
       user: { id: "user_123" },
       stripeCustomerId: "cus_123",
     } as never);
+    mockAssertUserCanStartBillingTransaction.mockResolvedValue(undefined);
   });
 
   it("returns the Stripe billing portal URL", async () => {
@@ -52,6 +61,39 @@ describe("redirectToBillingPortal", () => {
       return_url: "https://hackerai.co",
     });
     expect(mockPostHogError).not.toHaveBeenCalled();
+  });
+
+  it("opens the portal directly in payment method update mode", async () => {
+    mockCreateBillingPortalSession.mockResolvedValue({
+      id: "bps_recovery",
+      url: "https://billing.stripe.com/payment-method",
+    } as never);
+
+    const { default: redirectToBillingPortal } =
+      await import("../billing-portal");
+
+    await expect(redirectToBillingPortal("payment_method")).resolves.toBe(
+      "https://billing.stripe.com/payment-method",
+    );
+
+    expect(mockCreateBillingPortalSession).toHaveBeenCalledWith({
+      customer: "cus_123",
+      return_url:
+        "https://hackerai.co/?billing-recovery-return=1&refresh=entitlements",
+      flow_data: { type: "payment_method_update" },
+    });
+    expect(mockPostHogEvent).toHaveBeenCalledWith(
+      "payment_update_opened",
+      expect.objectContaining({
+        userId: "user_123",
+        org_id: "org_123",
+        stripe_customer_id: "cus_123",
+        stripe_billing_portal_session_id: "bps_recovery",
+        surface: "account_settings",
+        paid_funnel_event_version: 1,
+        $insert_id: "payment_update_opened:bps_recovery:user_123",
+      }),
+    );
   });
 
   it("logs the action stage when Stripe session creation fails", async () => {
@@ -136,4 +178,50 @@ describe("redirectToBillingPortal", () => {
       }),
     );
   });
+});
+
+describe("blocked-chat payment portal return", () => {
+  it("returns to the same chat with an actual entitlement refresh", async () => {
+    process.env.NEXT_PUBLIC_BASE_URL = "https://preview.example.com";
+    mockGetBillingActionContext.mockResolvedValue({
+      organizationId: "org_test",
+      user: { id: "user_test" },
+      stripeCustomerId: "cus_test",
+    } as never);
+    mockCreateBillingPortalSession.mockResolvedValue({
+      id: "bps_test",
+      url: "https://billing.stripe.com/test",
+    } as never);
+    const { default: openPortal } = await import("../billing-portal");
+    await openPortal("payment_method", {
+      surface: "blocked_chat",
+      returnPath: "/c/test-chat",
+    });
+    expect(mockCreateBillingPortalSession).toHaveBeenLastCalledWith({
+      customer: "cus_test",
+      return_url:
+        "https://preview.example.com/c/test-chat?billing-recovery-return=1&refresh=entitlements",
+      flow_data: { type: "payment_method_update" },
+    });
+    expect(mockPostHogEvent).toHaveBeenLastCalledWith(
+      "payment_update_opened",
+      expect.objectContaining({ surface: "blocked_chat" }),
+    );
+  });
+  it.each(["//evil.example", "/\\evil.example", "https://evil.example"])(
+    "does not redirect to an external return path %s",
+    async (returnPath) => {
+      const { default: openPortal } = await import("../billing-portal");
+      await openPortal("payment_method", {
+        surface: "blocked_chat",
+        returnPath,
+      });
+      expect(mockCreateBillingPortalSession).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          return_url:
+            "https://preview.example.com/?billing-recovery-return=1&refresh=entitlements",
+        }),
+      );
+    },
+  );
 });

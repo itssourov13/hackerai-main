@@ -1,3 +1,20 @@
+import { isAbliterationModel } from "@/lib/ai/abliteration";
+import {
+  enforceRegionalSubscriptionFirst,
+  subscriptionFirstCountryFromRequest,
+} from "@/lib/experiments/regional-subscription-first.server";
+import { formatToolStreamError } from "@/lib/chat/tool-stream-error";
+import { hasCompletedAssistantText } from "@/lib/analytics/free-activation";
+import { getRegionalFreeLimits } from "@/lib/rate-limit/regional-free-limits";
+import { regionalFreeCountryFromRequest } from "@/lib/rate-limit/regional-free-limits-request";
+import {
+  prepareProviderDisconnectContinuation,
+  PROVIDER_DISCONNECT_CONTINUATION_PROMPT,
+} from "@/lib/chat/agent-long-provider-retry";
+import { createRecoverableProviderErrorFilter } from "@/lib/chat/provider-error-stream";
+import { selectTaskOutcomeSurvey } from "@/lib/feedback/select-task-outcome";
+import { evaluateAbliteratedModel } from "@/lib/experiments/abliterated-model";
+import { AbliteratedModelTelemetry } from "@/lib/analytics/abliterated-model";
 import {
   createUIMessageStream,
   createUIMessageStreamResponse,
@@ -16,7 +33,6 @@ import { generateTitleFromUserMessageWithWriter } from "@/lib/actions";
 import { getUserIDAndPro } from "@/lib/auth/get-user-id";
 import { assertUserCanMakeCostIncurringRequest } from "@/lib/suspensions";
 import type {
-  ChatMode,
   LimitRescueRequest,
   Todo,
   SandboxPreference,
@@ -29,6 +45,7 @@ import {
   isLimitRescueRequest,
   normalizeMaxModelForSubscription,
   normalizeSelectedModelOverrideForSubscription,
+  withExtraUsageBillingForModel,
 } from "@/types";
 import { getBaseTodosForRequest } from "@/lib/utils/todo-utils";
 import {
@@ -42,6 +59,7 @@ import {
   getUsageSettlementInitialDeduction,
   getUnsettledUsagePoints,
   getPaidDailyFreeAllowanceStatus,
+  hasPaidDailyFreeAllowanceConsent,
   paidDailyFreeAllowanceStatusToMetadata,
   recordPaidDailyFreeAllowanceCost,
   recordFreeMonthlyCost,
@@ -62,6 +80,8 @@ import {
 } from "@/lib/token-utils";
 import { ChatSDKError } from "@/lib/errors";
 import PostHogClient from "@/app/posthog";
+import { selectCloudSandboxProvider } from "@/lib/ai/tools/utils/cloud-sandbox-provider";
+import { getRegionalExecutionContextForVercelRequest } from "@/lib/api/trigger-region";
 import {
   captureAgentBudgetAbort,
   captureAgentCompletionAnalytics,
@@ -69,9 +89,14 @@ import {
   captureUsageCost,
   captureUsageSettlement,
   createChatLogger,
+  resolveAgentAbortSource,
   shutdownPostHog,
   type ChatLogger,
 } from "@/lib/api/chat-logger";
+import {
+  KIMI_MAX_REASONING_EFFORT,
+  shouldUseMaxKimiReasoning,
+} from "@/lib/ai/kimi-reasoning";
 import {
   countFileAttachments,
   stripImageAttachments,
@@ -83,42 +108,57 @@ import {
   appendSystemReminderToLastUserMessage,
   injectNotesIntoMessages,
   assertFreeAgentGates,
-  assertTemporaryChatAccess,
+  assertChatModeAccess,
   buildExtraUsageConfig,
   estimatePreflightInputTokens,
+  getContentFilterRetryModel,
   getRetryFallbackModel,
   isAutoModelSelectionForRetry,
+  isExplicitDeepSeekProSelectionForRetry,
   resolveServedModelForCostAccounting,
+  shouldRetryAbliterationError,
 } from "@/lib/api/chat-stream-helpers";
 import { geolocation } from "@vercel/functions";
+import { AbliterationVisionError } from "@/lib/chat/abliteration-vision";
 import { NextRequest } from "next/server";
 import {
+  getMessagesByChatId,
+  getNotes,
+  getUserCustomization,
   handleInitialChatAndUserMessage,
+  prepareForNewStream,
   saveMessage,
+  startStream,
   updateChat,
   updateChatTitle,
-  getMessagesByChatId,
-  getUserCustomization,
-  prepareForNewStream,
-  startStream,
-  startTempStream,
-  deleteTempStreamForBackend,
 } from "@/lib/db/actions";
 import {
   createCancellationSubscriber,
   createPreemptiveTimeout,
 } from "@/lib/utils/stream-cancellation";
 import { v4 as uuidv4 } from "uuid";
-import { processChatMessages } from "@/lib/chat/chat-processor";
+import { processChatMessages, selectModel } from "@/lib/chat/chat-processor";
+import { cacheAuxiliaryVisionDescription } from "@/lib/utils/file-transform-utils";
+import {
+  createVisionSummaryRecoveryController,
+  describeImageAttachmentsWithAuxiliaryVision,
+  describeImageWithAuxiliaryVision,
+} from "@/lib/chat/auxiliary-vision";
 import { summarizeIncompleteToolParts } from "@/lib/chat/tool-abort-utils";
 import {
   hasVisibleAssistantContent,
   shouldSkipAbortedMessageSave,
   shouldUseUpdateOnlyForAbortedSave,
 } from "@/lib/chat/abort-persistence";
+import {
+  BACKGROUND_WORK_DRAIN_TIMEOUT_MS,
+  drainBackgroundWork,
+} from "@/lib/chat/background-work-drain";
 import { createTrackedProvider } from "@/lib/ai/providers";
 import {
   getSandboxUploadFailureMetadata,
+  getSandboxUploadUserMessage,
+  recoverProviderVisibleImagesAfterSandboxUploadFailure,
   uploadSandboxFiles,
   getUploadBasePath,
   rewriteSandboxFilePathsInMessages,
@@ -138,11 +178,20 @@ import {
 import { Id } from "@/convex/_generated/dataModel";
 import { phLogger } from "@/lib/posthog/server";
 import { PAID_FUNNEL_EVENTS } from "@/lib/analytics/paid-funnel";
+import { readAnalyticsRequestContext } from "@/lib/analytics/request-context";
+import { buildAgentStepLimitTelemetry } from "@/lib/analytics/agent-step-limit-telemetry";
 import {
-  buildAgentCompletionSignals,
-  createAgentCompletionSignalTracker,
-  recordHandledToolFailure,
-} from "@/lib/analytics/agent-completion-signals";
+  captureDeepSeekV4Pro0813ExperimentExposure,
+  evaluateDeepSeekV4Pro0813Experiment,
+  getActiveDeepSeekV4Pro0813ExperimentAssignment,
+  getDeepSeekV4Pro0813ExperimentContext,
+} from "@/lib/experiments/deepseek-v4-pro-0813";
+import {
+  evaluateFlashRouting,
+  getActiveFlashRoutingAssignment,
+  createFlashRoutingExposureRecorder,
+} from "@/lib/experiments/flash-routing";
+import { isEligibleForDirectGlmVision } from "@/lib/chat/auxiliary-vision-eligibility";
 import {
   capturePaidDailyFreeAllowanceServerEvent,
   createPaidDailyFreeAllowanceBudgetSnapshot,
@@ -152,17 +201,21 @@ import {
   getRateLimitErrorCapReason,
 } from "@/lib/api/paid-daily-free-allowance-rescue";
 import {
+  createProviderContentBlockedFinishReasonError,
   extractErrorDetails,
   getProviderErrorCategory,
   getProviderStatusCode,
   getUserFriendlyProviderError,
+  isProviderContentFilterFinishReason,
 } from "@/lib/utils/error-utils";
 import {
-  requireBooleanFlag,
   requireChatMessagesArray,
   requireOptionalIdentifier,
+  requireRetiredTemporaryFieldAbsent,
+  requireVercelChatMode,
 } from "@/lib/api/chat-request-validation";
 import { resolveProjectExecutionContext } from "@/lib/chat/project-context";
+import { isDesktopPreference } from "@/lib/sandbox/environment";
 import { isAgentMode } from "@/lib/utils/mode-helpers";
 import {
   createAgentStream,
@@ -180,9 +233,12 @@ import {
 import {
   omitImageViewToolResultsForProviderRetry,
   omitTrailingStepStartAssistantMessage,
+  uiMessagesContainImageViewResult,
 } from "@/lib/chat/multimodal-tool-result-recovery";
 import {
   detectAssistantContentLoopFromParts,
+  shouldRetryProviderStreamAfterNonDurableOutputLimit,
+  shouldRetryProviderStreamAfterReasoningOnlyOutput,
   shouldRetryProviderStreamAfterInterruptedToolInput,
   shouldRetryProviderStreamWithFallback,
 } from "@/lib/chat/agent-long-provider-retry";
@@ -201,6 +257,10 @@ export { getStreamContext };
 export const createChatHandler = () => {
   return async (req: NextRequest) => {
     const endpoint = "/api/chat" as const;
+    const incomingRequestId =
+      req.headers.get("x-vercel-id") ??
+      req.headers.get("x-request-id") ??
+      undefined;
     let preemptiveTimeout:
       ReturnType<typeof createPreemptiveTimeout> | undefined;
 
@@ -212,6 +272,34 @@ export const createChatHandler = () => {
     let outerChatId: string | undefined;
     let posthog: ReturnType<typeof PostHogClient> = null;
     let releaseFreeRunLock: (() => Promise<void>) | undefined;
+    let paidDailyFreeAllowanceUserId: string | undefined;
+    let paidDailyFreeAllowanceReservation:
+      PaidDailyFreeAllowanceReservation | undefined;
+    let paidDailyFreeAllowanceFinalized = false;
+    let paidDailyFreeAllowanceUsageTracker: UsageTracker | undefined;
+    const releasePaidDailyFreeAllowanceReservation = async () => {
+      if (
+        !paidDailyFreeAllowanceUserId ||
+        !paidDailyFreeAllowanceReservation ||
+        paidDailyFreeAllowanceFinalized
+      ) {
+        return;
+      }
+      const result = await recordPaidDailyFreeAllowanceCost(
+        paidDailyFreeAllowanceUserId,
+        0,
+        paidDailyFreeAllowanceReservation,
+      );
+      paidDailyFreeAllowanceFinalized = result.recorded;
+      if (!result.recorded) {
+        phLogger.warn("Paid daily free allowance lease release failed", {
+          userId: paidDailyFreeAllowanceUserId,
+          chatId: outerChatId,
+          endpoint,
+          cost_record_failure_reason: result.unavailableReason,
+        });
+      }
+    };
     const releaseFreeRunLockOnce = async () => {
       const release = releaseFreeRunLock;
       if (!release) return;
@@ -220,38 +308,45 @@ export const createChatHandler = () => {
     };
 
     try {
+      const rawRequestBody: unknown = await req.json();
+      requireRetiredTemporaryFieldAbsent(rawRequestBody);
+
       const {
         messages,
-        mode,
+        mode: rawMode,
         todos,
         chatId,
         regenerate,
-        temporary: rawTemporary,
         sandboxPreference,
         selectedModel: rawSelectedModel,
-        isAutoContinue,
+        isAutoContinue: rawIsAutoContinue,
+        isAutomaticContinuation: rawIsAutomaticContinuation,
         useClientMessagesForRegenerate,
         limitRescue: rawLimitRescue,
         projectId: rawProjectId,
-      }: {
+      } = rawRequestBody as {
         messages: unknown;
-        mode: ChatMode;
+        mode: unknown;
         chatId: string;
         todos?: Todo[];
         regenerate?: boolean;
-        temporary?: unknown;
         sandboxPreference?: SandboxPreference;
         selectedModel?: string;
         isAutoContinue?: boolean;
+        isAutomaticContinuation?: boolean;
         useClientMessagesForRegenerate?: boolean;
         limitRescue?: unknown;
         projectId?: unknown;
-      } = await req.json();
-      const temporary = requireBooleanFlag("temporary", rawTemporary);
+      };
+      const mode = requireVercelChatMode(rawMode);
+      const analyticsRequestContext = readAnalyticsRequestContext(req.headers);
       const requestedProjectId = requireOptionalIdentifier(
         "projectId",
         rawProjectId,
       );
+      const isAutoContinue = rawIsAutoContinue === true;
+      const isAutomaticContinuation =
+        isAutoContinue && rawIsAutomaticContinuation === true;
       outerChatId = chatId;
 
       const limitRescue: LimitRescueRequest | undefined = isLimitRescueRequest(
@@ -260,16 +355,21 @@ export const createChatHandler = () => {
         ? rawLimitRescue
         : undefined;
 
-      chatLogger = createChatLogger({ chatId, endpoint });
+      chatLogger = createChatLogger({
+        chatId,
+        endpoint,
+        requestId: incomingRequestId,
+      });
+      const requestId = chatLogger.getRequestId();
       chatLogger.setRequestDetails({
         mode,
-        isTemporary: temporary,
         isRegenerate: !!regenerate,
       });
       const requestMessages = requireChatMessagesArray(messages);
 
       const { userId, subscription, organizationId, freeQuotaSubject } =
         await getUserIDAndPro(req);
+      paidDailyFreeAllowanceUserId = userId;
       const freeUsageSubject = freeQuotaSubject ?? userId;
       let selectedModelOverride: SelectedModel | undefined =
         normalizeSelectedModelOverrideForSubscription(
@@ -277,11 +377,14 @@ export const createChatHandler = () => {
           subscription,
         );
       await assertUserCanMakeCostIncurringRequest(userId);
-      usageRefundTracker.setUser(userId, subscription, organizationId);
-      assertTemporaryChatAccess({
-        isTemporary: temporary,
+      await enforceRegionalSubscriptionFirst({
+        userId,
         subscription,
+        country: subscriptionFirstCountryFromRequest(req),
+        surface: "ask",
       });
+      usageRefundTracker.setUser(userId, subscription, organizationId);
+      assertChatModeAccess({ mode, subscription });
       if (subscription === "free") {
         const lock = await acquireFreeRunConcurrencyLock(
           freeUsageSubject,
@@ -290,6 +393,8 @@ export const createChatHandler = () => {
         releaseFreeRunLock = lock.release;
       }
       const userLocation = geolocation(req);
+      const { triggerRegion: executionRegion, requestRegionClass } =
+        getRegionalExecutionContextForVercelRequest(req, userLocation);
 
       // Add user context to logger (only region, not full location for privacy)
       chatLogger.setUser({
@@ -312,33 +417,52 @@ export const createChatHandler = () => {
           chatId,
           endpoint,
           abortController: userStopSignal,
-          requestId: req.headers.get("x-vercel-id") ?? undefined,
+          requestId,
           userId,
+          getLogContext: () => chatLogger?.getDiagnosticContext() ?? {},
         });
       }
 
-      const userCustomization = await getUserCustomization({ userId });
-
-      const fetched = await getMessagesByChatId({
-        chatId,
-        userId,
-        subscription,
-        newMessages: requestMessages,
-        regenerate,
-        isTemporary: temporary,
-        mode,
-        useClientMessagesForRegenerate,
-      });
+      // These reads only depend on the authenticated user, so overlap them
+      // instead of paying one Convex round-trip after another before the
+      // model call. Mirrors the Trigger agent route's preflight.
+      const [userCustomization, fetched] = await Promise.all([
+        getUserCustomization({ userId }),
+        getMessagesByChatId({
+          chatId,
+          userId,
+          subscription,
+          newMessages: requestMessages,
+          regenerate,
+          mode,
+          useClientMessagesForRegenerate,
+        }),
+      ]);
       const { chat, isNewChat, fileTokens } = fetched;
-      const projectContext = temporary
-        ? {}
-        : await resolveProjectExecutionContext({
-            chat,
-            requestedProjectId,
-            userId,
-            mode,
-            sandboxPreference,
-          });
+
+      // Notes are injected right before streaming. Start the fetch now so it
+      // overlaps the remaining preflight instead of adding a serial
+      // round-trip at the end. getNotes never rejects (it returns [] on error).
+      const shouldIncludeNotes = userCustomization?.include_notes ?? true;
+      const preloadedNotes = shouldIncludeNotes
+        ? getNotes({ userId, subscription })
+        : undefined;
+
+      const [projectContext, baseExtraUsageConfig] = await Promise.all([
+        resolveProjectExecutionContext({
+          chat,
+          requestedProjectId,
+          userId,
+          mode,
+          sandboxPreference,
+        }),
+        buildExtraUsageConfig({
+          userId,
+          subscription,
+          userCustomization,
+          organizationId,
+        }),
+      ]);
       const truncatedMessages =
         subscription === "free"
           ? stripImageAttachments(fetched.truncatedMessages)
@@ -346,33 +470,45 @@ export const createChatHandler = () => {
 
       const baseTodos: Todo[] = getBaseTodosForRequest(
         (chat?.todos as unknown as Todo[]) || [],
-        Array.isArray(todos) ? todos : [],
-        { isTemporary: temporary, regenerate },
+        { regenerate },
       );
-
-      const extraUsageConfig = await buildExtraUsageConfig({
-        userId,
-        subscription,
-        userCustomization,
-        organizationId,
-      });
-      const extraUsageAvailable = canUseExtraUsage(extraUsageConfig);
+      const extraUsageAvailable = canUseExtraUsage(baseExtraUsageConfig);
       selectedModelOverride =
         normalizeMaxModelForSubscription(selectedModelOverride, subscription, {
           extraUsageAvailable,
         }) ?? undefined;
-
-      if (!temporary) {
-        await handleInitialChatAndUserMessage({
-          chatId,
-          userId,
-          messages: stripLocalDesktopSourcePaths(truncatedMessages),
-          regenerate,
-          chat,
-          isHidden: isAutoContinue ? true : undefined,
-          projectId: projectContext.projectId,
+      const extraUsageConfig = withExtraUsageBillingForModel(
+        baseExtraUsageConfig,
+        selectedModelOverride,
+        subscription,
+      );
+      const attachmentCounts = countFileAttachments(truncatedMessages);
+      const directGlmVisionEnabled =
+        (isAgentMode(mode) || attachmentCounts.imageCount > 0) &&
+        isEligibleForDirectGlmVision({
+          subscription,
+          selectedModelOverride,
         });
-      }
+      await handleInitialChatAndUserMessage({
+        chatId,
+        userId,
+        messages: stripLocalDesktopSourcePaths(truncatedMessages),
+        regenerate,
+        chat,
+        isHidden: isAutoContinue ? true : undefined,
+        projectId: projectContext.projectId,
+      });
+
+      const regionalFreeLimits = getRegionalFreeLimits({
+        userId,
+        subscription,
+        country: regionalFreeCountryFromRequest(req),
+      });
+      const freeLimits = regionalFreeLimits;
+      const freeMonthlyBudgetSnapshot =
+        subscription === "free"
+          ? await checkFreeMonthlyCostLimit(freeUsageSubject, freeLimits)
+          : null;
 
       // Free ask: pre-flight rate-limit before any token counting/model work.
       const freeAskRateLimitInfo =
@@ -386,6 +522,7 @@ export const createChatHandler = () => {
               undefined,
               undefined,
               freeQuotaSubject,
+              freeLimits,
             )
           : null;
 
@@ -393,18 +530,29 @@ export const createChatHandler = () => {
         ? getUploadBasePath(sandboxPreference)
         : undefined;
 
-      let { processedMessages, selectedModel, sandboxFiles } =
-        await processChatMessages({
-          messages: truncatedMessages,
-          mode,
-          userId,
-          subscription,
-          uploadBasePath,
-          modelOverride: selectedModelOverride,
-          extraUsageAvailable,
-          allowLocalDesktopFiles:
-            isAgentMode(mode) && sandboxPreference === "desktop",
-        });
+      let {
+        processedMessages,
+        selectedModel,
+        sandboxFiles,
+        platformAuthorized,
+        paidFirstStepVariant,
+        moderationChecked,
+      } = await processChatMessages({
+        abliterationPosthog: (posthog ??= PostHogClient()),
+        limitRescue: Boolean(limitRescue),
+        messages: truncatedMessages,
+        mode,
+        userId,
+        subscription,
+        uploadBasePath,
+        modelOverride: selectedModelOverride,
+        extraUsageAvailable,
+        allowLocalDesktopFiles:
+          isAgentMode(mode) && isDesktopPreference(sandboxPreference ?? "e2b"),
+        directGlmVisionEnabled,
+        chatId,
+        requestId,
+      });
 
       // Empty after processing → providers reject the request before the route can stream.
       if (!processedMessages || processedMessages.length === 0) {
@@ -414,12 +562,75 @@ export const createChatHandler = () => {
           getEmptyProcessedMessagesMetadata(truncatedMessages, {
             regenerate: !!regenerate,
             isAutoContinue: !!isAutoContinue,
-            isTemporary: temporary,
             sandboxPreference,
           }),
         );
       }
 
+      const assistantMessageId = uuidv4();
+      const abliteratedExperiment = await evaluateAbliteratedModel({
+        posthog: (posthog ??= PostHogClient()),
+        userId,
+        selectedModel,
+        subscription,
+        mode,
+        selectedModelOverride,
+        moderationEligible: platformAuthorized,
+        paidFirstStepVariant,
+        moderationChecked,
+        messages: truncatedMessages,
+        limitRescue: Boolean(limitRescue),
+        ...(process.env.VERCEL_ENV === "preview" && {
+          previewDiagnosticContext: { chatId, requestId },
+        }),
+      });
+      if (abliteratedExperiment) selectedModel = abliteratedExperiment.modelKey;
+
+      const abliteratedTelemetry = abliteratedExperiment
+        ? new AbliteratedModelTelemetry(posthog, userId, {
+            assignment: abliteratedExperiment,
+            messageId: assistantMessageId,
+            chatId,
+            mode,
+            subscription,
+            selectedModelOverride,
+          })
+        : undefined;
+
+      const taskOutcomeSurvey = await selectTaskOutcomeSurvey({
+        assignment: abliteratedExperiment,
+        selectedModelOverride,
+        posthog,
+        userId,
+        chatId,
+        messageId: assistantMessageId,
+        mode,
+        subscription,
+      });
+
+      const deepSeekV4Pro0813Experiment =
+        await evaluateDeepSeekV4Pro0813Experiment({
+          posthog: (posthog ??= PostHogClient()),
+          userId,
+          selectedModel,
+          requestId,
+        });
+      if (deepSeekV4Pro0813Experiment) {
+        selectedModel = deepSeekV4Pro0813Experiment.modelKey;
+      }
+      const requestHasImages =
+        countFileAttachments(fetched.truncatedMessages).imageCount > 0 ||
+        uiMessagesContainImageViewResult(processedMessages);
+      const flashRoutingAssignment = await evaluateFlashRouting({
+        posthog,
+        userId,
+        mode,
+        subscription,
+        selectedModel,
+        hasImages: requestHasImages,
+      });
+      if (flashRoutingAssignment)
+        selectedModel = flashRoutingAssignment.modelKey;
       const notesEnabled =
         (subscription !== "free" || isAgentMode(mode)) &&
         (userCustomization?.include_notes ?? true);
@@ -430,12 +641,25 @@ export const createChatHandler = () => {
         userId,
         selectedModel,
         userCustomization,
-        temporary,
         truncatedMessages,
       });
 
       // PostHog client for analytics.
-      posthog = PostHogClient();
+      posthog ??= PostHogClient();
+      const cloudSandboxSelection =
+        isAgentMode(mode) && (!sandboxPreference || sandboxPreference === "e2b")
+          ? await selectCloudSandboxProvider({
+              userId,
+              subscription,
+              environment: process.env.VERCEL_ENV ?? "development",
+              triggerRegion: executionRegion,
+              requestRegionClass,
+              featureFlagClient: posthog,
+            })
+          : ({
+              provider: "e2b",
+              reason: "miosa_rollout_control",
+            } as const);
 
       const fileCounts = countFileAttachments(truncatedMessages);
       const chatLogContext = {
@@ -448,8 +672,6 @@ export const createChatHandler = () => {
       };
       chatLogger.setChat(chatLogContext, selectedModel);
 
-      let paidDailyFreeAllowanceReservation:
-        PaidDailyFreeAllowanceReservation | undefined;
       let rateLimitInfo: RateLimitInfo;
 
       try {
@@ -464,6 +686,7 @@ export const createChatHandler = () => {
             selectedModel,
             organizationId,
             freeQuotaSubject,
+            freeLimits,
           ));
       } catch (error) {
         if (!(error instanceof ChatSDKError)) {
@@ -495,6 +718,7 @@ export const createChatHandler = () => {
           mode,
           capReason,
           hasAttachments: fileCounts.totalFiles > 0,
+          selectedModel: selectedModelOverride ?? null,
         };
         const allowanceStatus =
           await getPaidDailyFreeAllowanceStatus(allowanceContext);
@@ -505,7 +729,7 @@ export const createChatHandler = () => {
           paidDailyFreeAllowance: allowanceMetadata,
         };
 
-        if (!limitRescue) {
+        if (!hasPaidDailyFreeAllowanceConsent(allowanceStatus, limitRescue)) {
           throw error;
         }
 
@@ -556,10 +780,39 @@ export const createChatHandler = () => {
         });
       }
 
-      const freeMonthlyBudgetSnapshot =
-        subscription === "free"
-          ? await checkFreeMonthlyCostLimit(freeUsageSubject)
-          : null;
+      const activeDeepSeekV4Pro0813Experiment =
+        getActiveDeepSeekV4Pro0813ExperimentAssignment(
+          deepSeekV4Pro0813Experiment,
+          selectedModel,
+        );
+      const activeFlashRoutingAssignment = getActiveFlashRoutingAssignment(
+        flashRoutingAssignment,
+        selectedModel,
+        !!paidDailyFreeAllowanceReservation,
+      );
+      const activeAbliteratedExperiment =
+        !paidDailyFreeAllowanceReservation &&
+        abliteratedExperiment?.modelKey === selectedModel
+          ? abliteratedExperiment
+          : undefined;
+      const recordFlashRoutingExposure = createFlashRoutingExposureRecorder({
+        posthog,
+        assignment: activeFlashRoutingAssignment,
+        userId,
+        mode,
+        subscription,
+        requestId: assistantMessageId,
+      });
+      const routingExperimentContext = activeAbliteratedExperiment
+        ? {
+            key: activeAbliteratedExperiment.key,
+            variant: activeAbliteratedExperiment.variant,
+            requestId: assistantMessageId,
+          }
+        : (activeFlashRoutingAssignment ??
+          getDeepSeekV4Pro0813ExperimentContext(
+            activeDeepSeekV4Pro0813Experiment,
+          ));
 
       usageRefundTracker.recordDeductions(rateLimitInfo);
 
@@ -574,22 +827,12 @@ export const createChatHandler = () => {
         extraUsageConfig,
       );
 
-      const assistantMessageId = uuidv4();
       chatLogger.getBuilder().setAssistantId(assistantMessageId);
-
-      if (temporary) {
-        try {
-          await startTempStream({ chatId, userId });
-        } catch {
-          // Best-effort; temp coordination must not block the request.
-        }
-      }
 
       // Start cancellation subscriber (Redis pub/sub with fallback to polling)
       let subscriberStopped = false;
       const cancellationSubscriber = await createCancellationSubscriber({
         chatId,
-        isTemporary: temporary,
         abortController: userStopSignal,
         onStop: () => {
           subscriberStopped = true;
@@ -597,7 +840,14 @@ export const createChatHandler = () => {
       });
 
       const summarizationTracker = new SummarizationTracker();
-
+      const visionSummaryRecovery = createVisionSummaryRecoveryController({
+        available: directGlmVisionEnabled,
+        service: "chat-handler",
+        requestId,
+        userId,
+        chatId,
+        isUserAborted: () => userStopSignal.signal.aborted,
+      });
       chatLogger.startStream();
 
       const stream = createUIMessageStream({
@@ -613,6 +863,33 @@ export const createChatHandler = () => {
         },
         execute: async ({ writer }) => {
           try {
+            const usageTracker = new UsageTracker();
+            paidDailyFreeAllowanceUsageTracker = usageTracker;
+            const auxiliaryVision = directGlmVisionEnabled
+              ? {
+                  isEnabled: visionSummaryRecovery.isEnabled,
+                  isAborted: () => userStopSignal.signal.aborted,
+                  describeImage: async (args: {
+                    image: string;
+                    mediaType: string;
+                    filename?: string;
+                    source: "file_view";
+                  }) => {
+                    return await describeImageWithAuxiliaryVision({
+                      ...args,
+                      requestId,
+                      userId,
+                      chatId,
+                      abortSignal: userStopSignal.signal,
+                      onCost: (costDollars) => {
+                        usageTracker.providerCost += costDollars;
+                        usageTracker.nonModelCost += costDollars;
+                        chatLogger?.getBuilder().addToolCost(costDollars);
+                      },
+                    });
+                  },
+                }
+              : undefined;
             sendRateLimitWarnings(writer, {
               subscription,
               mode,
@@ -627,10 +904,6 @@ export const createChatHandler = () => {
               }),
             });
 
-            const completionSignalTracker =
-              createAgentCompletionSignalTracker();
-            const onToolFailure = () =>
-              recordHandledToolFailure(completionSignalTracker);
             const {
               tools,
               ensureSandbox,
@@ -638,6 +911,7 @@ export const createChatHandler = () => {
               getFileAccumulator,
               sandboxManager,
               getSandboxSessionCost,
+              getSandboxSessionUsage,
               setCurrentModelName,
               getToolsForModel,
             } = createTools(
@@ -648,7 +922,6 @@ export const createChatHandler = () => {
               userLocation,
               baseTodos,
               notesEnabled,
-              temporary,
               assistantMessageId,
               sandboxPreference,
               process.env.CONVEX_SERVICE_ROLE_KEY,
@@ -663,10 +936,20 @@ export const createChatHandler = () => {
                 chatLogger?.setSandboxBoot(info);
               },
               selectedModel,
-              onToolFailure,
+              undefined,
+              undefined,
               undefined,
               undefined,
               projectContext.workingDirectory,
+              undefined,
+              auxiliaryVision,
+              {
+                cloudSandboxProvider: cloudSandboxSelection.provider,
+                cloudSandboxSelectionReason: cloudSandboxSelection.reason,
+                triggerRegion: executionRegion,
+                environment: process.env.VERCEL_ENV ?? "development",
+                signal: userStopSignal.signal,
+              },
             );
 
             // Helper to send file metadata via stream for resumable stream clients
@@ -749,42 +1032,70 @@ export const createChatHandler = () => {
                 uploadResult = await uploadSandboxFiles(
                   sandboxFiles,
                   ensureSandbox,
-                  { retryWithFreshSandboxOnTransientFailure: true },
+                  {
+                    signal: userStopSignal.signal,
+                    retryAfterReconnectOnTransientFailure: true,
+                    logContext: {
+                      service: "chat-handler",
+                      requestId,
+                      userId,
+                      chatId,
+                    },
+                  },
                 );
               } finally {
                 writeUploadCompleteStatus(writer);
               }
               if (uploadResult.failedCount > 0) {
-                const noun =
-                  uploadResult.failedCount === 1 ? "attachment" : "attachments";
-                const uploadError = new ChatSDKError(
-                  "bad_request:sandbox",
-                  `Failed to upload ${uploadResult.failedCount} ${noun} to the computer. Please try again.`,
-                  getSandboxUploadFailureMetadata(uploadResult),
+                const recoveredMessages =
+                  recoverProviderVisibleImagesAfterSandboxUploadFailure(
+                    processedMessages,
+                    sandboxFiles,
+                    uploadResult,
+                    {
+                      service: "chat-handler",
+                      requestId,
+                      userId,
+                      chatId,
+                    },
+                  );
+                if (recoveredMessages) {
+                  processedMessages = recoveredMessages;
+                } else {
+                  const uploadError = new ChatSDKError(
+                    "bad_request:sandbox",
+                    getSandboxUploadUserMessage(uploadResult),
+                    getSandboxUploadFailureMetadata(uploadResult),
+                  );
+                  // Errors thrown from execute are caught by createUIMessageStream's
+                  // onError and never reach the outer catch, so refund / timeout
+                  // clear / error logging must happen here. refund() is idempotent.
+                  preemptiveTimeout?.clear();
+                  await usageRefundTracker.refund();
+                  chatLogger?.emitChatError(uploadError);
+                  throw uploadError;
+                }
+              } else {
+                processedMessages = rewriteSandboxFilePathsInMessages(
+                  processedMessages,
+                  uploadResult.pathRewrites,
                 );
-                // Errors thrown from execute are caught by createUIMessageStream's
-                // onError and never reach the outer catch, so refund / timeout
-                // clear / error logging must happen here. refund() is idempotent.
-                preemptiveTimeout?.clear();
-                await usageRefundTracker.refund();
-                chatLogger?.emitChatError(uploadError);
-                throw uploadError;
               }
-              processedMessages = rewriteSandboxFilePathsInMessages(
-                processedMessages,
-                uploadResult.pathRewrites,
-              );
             }
 
-            // Generate title in parallel only for non-temporary new chats
-            const titlePromise =
-              isNewChat && !temporary
-                ? generateTitleFromUserMessageWithWriter(
-                    processedMessages,
-                    writer,
-                    (title) => updateChatTitle({ chatId, title }),
-                  )
-                : Promise.resolve(undefined);
+            // Generate the title in parallel for new tasks.
+            const titlePromise = isNewChat
+              ? generateTitleFromUserMessageWithWriter(
+                  fetched.truncatedMessages,
+                  writer,
+                  (title) => updateChatTitle({ chatId, title }),
+                  (costDollars) => {
+                    usageTracker.providerCost += costDollars;
+                    usageTracker.nonModelCost += costDollars;
+                    chatLogger?.getBuilder().addToolCost(costDollars);
+                  },
+                )
+              : Promise.resolve(undefined);
 
             const trackedProvider = createTrackedProvider();
 
@@ -794,8 +1105,10 @@ export const createChatHandler = () => {
               subscription,
               selectedModel,
               userCustomization,
-              temporary,
               sandboxContext,
+              "full_access",
+              false,
+              cloudSandboxSelection.provider,
             );
 
             const systemPromptTokens = safeCountTokens(currentSystemPrompt);
@@ -829,17 +1142,15 @@ export const createChatHandler = () => {
 
             // Inject notes into messages instead of system prompt
             // to keep the system prompt stable for prompt caching
-            const shouldIncludeNotes = userCustomization?.include_notes ?? true;
             const noteInjectionOpts = {
               userId,
               subscription,
               shouldIncludeNotes,
-              isTemporary: temporary,
             };
-            finalMessages = await injectNotesIntoMessages(
-              finalMessages,
-              noteInjectionOpts,
-            );
+            finalMessages = await injectNotesIntoMessages(finalMessages, {
+              ...noteInjectionOpts,
+              preloadedNotes,
+            });
 
             // Mutable stream state — updated in-place by the shared runner.
             const state = initAgentStreamState(
@@ -853,6 +1164,8 @@ export const createChatHandler = () => {
                   )
                 : { usedTokens: 0, maxTokens: 0 },
             );
+
+            state.sourceUiMessages = processedMessages;
 
             // Mid-stream budget enforcement. Paid users use their subscription
             // bucket; free users use an internal monthly cost cap.
@@ -875,9 +1188,15 @@ export const createChatHandler = () => {
                 : freeMonthlyBudgetSnapshot);
             const isReasoningModel = isAgentMode(mode);
 
-            const streamStartTime = Date.now();
             const configuredModelId =
               trackedProvider.languageModel(selectedModel).modelId;
+            const useMaxKimiReasoning = shouldUseMaxKimiReasoning({
+              subscription,
+              mode,
+              selectedModel,
+              configuredModelId,
+            });
+            const streamStartTime = Date.now();
             const budgetMonitor = effectiveBudgetSnapshot
               ? new BudgetMonitor(
                   effectiveBudgetSnapshot,
@@ -891,16 +1210,22 @@ export const createChatHandler = () => {
 
             let isRetryWithFallback = false;
             let retryUsedFallbackModel = false;
+            const retrySelectionModel =
+              abliteratedExperiment &&
+              isAbliterationModel(abliteratedExperiment.modelKey)
+                ? abliteratedExperiment.baselineModel
+                : selectedModel;
             const isAutoModel = isAutoModelSelectionForRetry({
-              selectedModel,
+              selectedModel: retrySelectionModel,
               selectedModelOverride,
             });
-            const fallbackModel = getRetryFallbackModel(selectedModel, mode);
-            const fallbackModelId =
-              trackedProvider.languageModel(fallbackModel).modelId;
+            const fallbackModel =
+              abliteratedExperiment &&
+              isAbliterationModel(abliteratedExperiment.modelKey)
+                ? abliteratedExperiment.baselineModel
+                : getRetryFallbackModel(selectedModel, mode);
             let activeModelName = selectedModel;
 
-            const usageTracker = new UsageTracker();
             let hasRecordedUsage = false;
             // Snapshot cache tokens before fallback retry so we can isolate fallback-only metrics
             let preFallbackCacheRead = 0;
@@ -911,11 +1236,17 @@ export const createChatHandler = () => {
                 : createUsageSettlementState(rateLimitInfo);
             let usageSettlementSequence = 0;
 
-            const deductAccumulatedUsage = async () => {
+            const deductAccumulatedUsage = async (
+              assistantMessageIdForUsage = assistantMessageId,
+            ) => {
               try {
                 if (hasRecordedUsage) return;
-                // Add E2B sandbox session cost (duration-based)
-                const sandboxCost = getSandboxSessionCost();
+                // Title generation starts in parallel with the main stream.
+                // Wait for it so its provider cost is included exactly once.
+                await titlePromise;
+                // Add cloud sandbox session cost (duration-based).
+                const sandboxUsage = await getSandboxSessionUsage();
+                const sandboxCost = sandboxUsage.totalCostDollars;
                 if (sandboxCost > 0) {
                   usageTracker.providerCost += sandboxCost;
                   usageTracker.nonModelCost += sandboxCost;
@@ -923,7 +1254,12 @@ export const createChatHandler = () => {
                 }
 
                 if (!usageTracker.hasUsage) {
-                  // No usage data reported — skip deduction
+                  // Release an unused rescue lease so a failed provider start
+                  // does not block the user's next sequential rescue.
+                  if (paidDailyFreeAllowanceReservation) {
+                    await releasePaidDailyFreeAllowanceReservation();
+                    hasRecordedUsage = paidDailyFreeAllowanceFinalized;
+                  }
                   return;
                 }
                 hasRecordedUsage = true;
@@ -942,20 +1278,20 @@ export const createChatHandler = () => {
                 let usageCostRecord =
                   usageTracker.createUsageCostRecord(usageRecordArgs);
 
-                // Trust accumulated provider cost only when every model step has
-                // an authoritative cost. providerCost also includes tool/sandbox
-                // spend; if any model step is missing cost, keep token fallback
-                // for the model portion and add nonModelCost separately.
-                const providerCost = usageTracker.hasAuthoritativeModelCost
-                  ? usageTracker.providerCost
-                  : undefined;
+                // Use the same resolved provider/hybrid total that powers
+                // mid-run settlement. This preserves authoritative step costs
+                // and estimates only the individual steps missing provider cost.
+                const settledCostDollars = usageCostRecord.costDollars;
 
                 if (paidDailyFreeAllowanceReservation) {
                   const allowanceCostRecord =
                     await recordPaidDailyFreeAllowanceCost(
                       userId,
                       usageCostRecord.costDollars,
+                      paidDailyFreeAllowanceReservation,
                     );
+                  paidDailyFreeAllowanceFinalized =
+                    allowanceCostRecord.recorded;
                   if (!allowanceCostRecord.recorded) {
                     phLogger.warn(
                       "Paid daily free allowance cost recording failed",
@@ -976,6 +1312,7 @@ export const createChatHandler = () => {
                     userId,
                     organizationId,
                     chatId,
+                    assistantMessageId: assistantMessageIdForUsage,
                     endpoint,
                     mode,
                     subscription,
@@ -1030,7 +1367,7 @@ export const createChatHandler = () => {
                     usageTracker.inputTokens,
                     usageTracker.outputTokens,
                     extraUsageConfig,
-                    providerCost,
+                    settledCostDollars,
                     selectedModel,
                     usageTracker.nonModelCost,
                     organizationId,
@@ -1087,6 +1424,7 @@ export const createChatHandler = () => {
                     userId,
                     organizationId,
                     chatId,
+                    assistantMessageId: assistantMessageIdForUsage,
                     endpoint,
                     mode,
                     subscription,
@@ -1100,6 +1438,10 @@ export const createChatHandler = () => {
                   });
                 }
                 captureUsageCost({
+                  cacheHistoryTelemetry: state.cacheHistoryTelemetry,
+                  usageMeasurement:
+                    usageTracker.measurementProperties(selectedModel),
+                  regionalFreeLimits,
                   posthog,
                   userId,
                   subscription,
@@ -1108,7 +1450,14 @@ export const createChatHandler = () => {
                   endpoint,
                   mode,
                   usage: usageCostRecord,
+                  ...(sandboxCost > 0 && { sandboxUsage }),
                   responseModel: state.responseModel,
+                  analyticsRequestContext,
+                  experiment: routingExperimentContext,
+                  fallbackServed:
+                    state.responseModel && retryUsedFallbackModel
+                      ? true
+                      : state.fallbackServed,
                   ...(usageSettlementState && {
                     usageSettlement: {
                       id: usageTracker.usageSettlementId,
@@ -1129,7 +1478,12 @@ export const createChatHandler = () => {
             };
 
             const settleUsageAfterStep: AgentStreamContext["settleUsageAfterStep"] =
-              async ({ currentCostDollars, force, model }) => {
+              async ({
+                currentCostDollars,
+                sandboxCostDollars,
+                force,
+                model,
+              }) => {
                 if (!usageSettlementState || hasRecordedUsage) return;
                 if (
                   !shouldSettleUsageMidRun({
@@ -1173,6 +1527,7 @@ export const createChatHandler = () => {
                     additional_cost_points: additionalCostPoints,
                     usage_settlement_id: usageTracker.usageSettlementId,
                     current_cost_dollars: currentCostDollars,
+                    sandbox_cost_dollars: sandboxCostDollars,
                     force,
                     error_name:
                       error instanceof Error ? error.name : "UnknownError",
@@ -1195,13 +1550,15 @@ export const createChatHandler = () => {
                   endpoint,
                   mode,
                   model,
-                  requestId: req.headers.get("x-vercel-id") ?? undefined,
+                  requestId,
                   usageSettlementId: usageTracker.usageSettlementId,
                   settlementSequence: usageSettlementSequence,
                   currentCostDollars,
+                  sandboxCostDollars,
                   requestedDeltaPoints: additionalCostPoints,
                   deduction: deductionResult,
                   forced: force,
+                  experiment: routingExperimentContext,
                 });
 
                 usageRefundTracker.addDeductions(deductionResult);
@@ -1226,6 +1583,7 @@ export const createChatHandler = () => {
                   selected_model: selectedModel,
                   additional_cost_points: additionalCostPoints,
                   current_cost_dollars: currentCostDollars,
+                  sandbox_cost_dollars: sandboxCostDollars,
                   included_points_deducted:
                     cumulativeDeduction.includedPointsDeducted,
                   extra_usage_points_deducted:
@@ -1238,8 +1596,59 @@ export const createChatHandler = () => {
                 userStopSignal.abort();
               };
 
+            const backgroundStreamWork = new Set<Promise<void>>();
+            const registerBackgroundStreamWork = (work: Promise<void>) => {
+              backgroundStreamWork.add(work);
+              void work.then(
+                () => backgroundStreamWork.delete(work),
+                () => backgroundStreamWork.delete(work),
+              );
+            };
+            const drainBackgroundStreamWork = async () => {
+              const result = await drainBackgroundWork(backgroundStreamWork, {
+                signal: userStopSignal.signal,
+              });
+              if (result.status !== "completed") {
+                phLogger.warn("Agent background work drain incomplete", {
+                  event: "agent_background_work_drain_incomplete",
+                  service: "chat-handler",
+                  chat_id: chatId,
+                  user_id: userId,
+                  mode,
+                  endpoint,
+                  drain_status: result.status,
+                  pending_work_count: result.pendingCount,
+                  drain_duration_ms: result.durationMs,
+                  drain_timeout_ms: BACKGROUND_WORK_DRAIN_TIMEOUT_MS,
+                });
+              }
+            };
+
             // Shared runner context.
             const streamCtx: AgentStreamContext = {
+              cacheVisionDescription: cacheAuxiliaryVisionDescription,
+              onAgentGuardrail: (observation) =>
+                phLogger.warn("Agent guardrail observed", {
+                  event: "agent_guardrail_observed",
+                  configured_model: selectedModel,
+                  userId,
+                  user_id: userId,
+                  request_id: requestId,
+                  chat_id: chatId,
+                  endpoint,
+                  mode,
+                  ...observation,
+                }),
+              abliteratedTelemetry,
+              ...(activeAbliteratedExperiment &&
+                isAbliterationModel(activeAbliteratedExperiment.modelKey) && {
+                  abliteratedStepRouting: {
+                    baselineModel: activeAbliteratedExperiment.baselineModel,
+                  },
+                }),
+              onProviderRequestStart: (configuredModel) => {
+                recordFlashRoutingExposure(configuredModel);
+              },
               trackedProvider,
               currentSystemPrompt,
               tools,
@@ -1247,16 +1656,26 @@ export const createChatHandler = () => {
               endpoint,
               userId,
               subscription,
+              selectedModelOverride,
               chatId,
-              temporary,
               fileTokens,
               noteInjectionOpts,
               systemPromptTokens,
               ctxSystemTokens,
               ctxMaxTokens,
               streamStartTime,
+              onModelChunk: () => chatLogger?.markFirstChunk(),
+              onModelStepSelected: (modelName) => {
+                activeModelName = modelName;
+                setCurrentModelName(modelName);
+              },
               contextUsageOn,
               isReasoningModel,
+              platformAuthorized,
+              get auxiliaryVisionEnabled() {
+                return visionSummaryRecovery.isEnabled();
+              },
+              directGlmVisionEnabled,
               maxDurationMs: AGENT_MAX_STREAM_DURATION_MS,
               writer,
               abortController: userStopSignal,
@@ -1268,8 +1687,18 @@ export const createChatHandler = () => {
               ensureSandbox,
               chatLogger,
               usageRefundTracker,
-              completionSignalTracker,
+              registerBackgroundWork: registerBackgroundStreamWork,
+              getSandboxCostDollars: getSandboxSessionCost,
               settleUsageAfterStep,
+              ...(useMaxKimiReasoning && {
+                providerReasoningOverride: {
+                  modelName: selectedModel,
+                  reasoning: {
+                    enabled: true,
+                    effort: KIMI_MAX_REASONING_EFFORT,
+                  },
+                },
+              }),
               onBudgetAbort: (details) =>
                 captureAgentBudgetAbort({
                   posthog,
@@ -1289,23 +1718,66 @@ export const createChatHandler = () => {
                 preemptiveTimeout?.isPreemptive() ? "timeout" : null,
             };
 
-            const createStream = (modelName: string) => {
+            const createStream = (
+              modelName: string,
+              excludedProviderModelSlugs?: readonly string[],
+            ) => {
+              if (modelName !== selectedModel) {
+                streamCtx.abliteratedStepRouting = undefined;
+              }
               activeModelName = modelName;
               streamCtx.tools = getToolsForModel(modelName);
+              streamCtx.excludedProviderModelSlugs = excludedProviderModelSlugs;
               setCurrentModelName(modelName);
               return createAgentStream(modelName, streamCtx, state);
             };
 
             let result;
             try {
+              captureDeepSeekV4Pro0813ExperimentExposure({
+                posthog,
+                userId,
+                subscription,
+                mode,
+                selectedModelOverride,
+                selectedModel,
+                configuredModel: configuredModelId,
+                assignment: activeDeepSeekV4Pro0813Experiment,
+              });
               result = await createStream(selectedModel);
             } catch (error) {
+              const shouldRecoverVisionApiError =
+                directGlmVisionEnabled &&
+                !visionSummaryRecovery.isEnabled() &&
+                (countFileAttachments(state.finalMessages).imageCount > 0 ||
+                  uiMessagesContainImageViewResult(state.finalMessages));
+              const shouldRecoverAbliterationApiError =
+                shouldRetryAbliterationError(
+                  activeAbliteratedExperiment,
+                  activeModelName,
+                  userStopSignal.signal,
+                );
               // If provider returns an API error before streaming, retry with fallback.
               if (
-                isProviderApiError(error) &&
                 !isRetryWithFallback &&
-                isAutoModel
+                !userStopSignal.signal.aborted &&
+                (shouldRecoverAbliterationApiError ||
+                  (isProviderApiError(error) &&
+                    !(error instanceof AbliterationVisionError) &&
+                    (isAutoModel || shouldRecoverVisionApiError)))
               ) {
+                const apiRetryModel = shouldRecoverAbliterationApiError
+                  ? fallbackModel
+                  : shouldRecoverVisionApiError
+                    ? selectModel(
+                        mode,
+                        subscription,
+                        selectedModelOverride,
+                        false,
+                        false,
+                        { extraUsageAvailable },
+                      )
+                    : fallbackModel;
                 phLogger.error("Provider API error, retrying with fallback", {
                   error,
                   chatId,
@@ -1313,11 +1785,11 @@ export const createChatHandler = () => {
                   mode,
                   originalModel: selectedModel,
                   requestedModelSlug: configuredModelId,
-                  fallbackModel,
-                  fallbackModelSlug: fallbackModelId,
+                  fallbackModel: apiRetryModel,
+                  fallbackModelSlug:
+                    trackedProvider.languageModel(apiRetryModel).modelId,
                   userId,
                   subscription,
-                  isTemporary: temporary,
                   preFallbackCacheReadTokens: usageTracker.cacheReadTokens,
                   preFallbackCacheWriteTokens: usageTracker.cacheWriteTokens,
                   ...extractErrorDetails(error),
@@ -1326,10 +1798,11 @@ export const createChatHandler = () => {
                 isRetryWithFallback = true;
                 retryUsedFallbackModel = retryUsesDifferentModel(
                   selectedModel,
-                  fallbackModel,
+                  apiRetryModel,
                 );
                 resetServedModelTelemetryForRetry(state);
                 state.lastStepInputTokens = 0;
+                state.stoppedDueToStepLimit = false;
                 state.stoppedDueToTokenExhaustion = false;
                 state.stoppedDueToElapsedTimeout = false;
                 state.stoppedDueToDoomLoop = false;
@@ -1348,14 +1821,70 @@ export const createChatHandler = () => {
                 // only billed for the fallback. Non-model spend (sandbox/tools)
                 // is preserved.
                 usageTracker.resetModelLeg();
-                result = await createStream(fallbackModel);
+                if (
+                  shouldRecoverVisionApiError &&
+                  !shouldRecoverAbliterationApiError
+                ) {
+                  visionSummaryRecovery.activate({
+                    error,
+                    source:
+                      countFileAttachments(state.finalMessages).imageCount > 0
+                        ? "attachment"
+                        : "file_view",
+                  });
+                  try {
+                    state.finalMessages =
+                      await describeImageAttachmentsWithAuxiliaryVision({
+                        messages: omitImageViewToolResultsForProviderRetry(
+                          state.finalMessages,
+                        ).messages,
+                        requestId,
+                        userId,
+                        chatId,
+                        abortSignal: userStopSignal.signal,
+                        onCost: (costDollars) => {
+                          usageTracker.providerCost += costDollars;
+                          usageTracker.nonModelCost += costDollars;
+                          chatLogger?.getBuilder().addToolCost(costDollars);
+                        },
+                        cacheDescription: cacheAuxiliaryVisionDescription,
+                      });
+                  } catch (summaryError) {
+                    preemptiveTimeout?.clear();
+                    await usageRefundTracker.refund();
+                    userStopSignal.signal.throwIfAborted();
+                    chatLogger?.emitUnexpectedError(summaryError);
+                    throw error;
+                  }
+                }
+                userStopSignal.signal.throwIfAborted();
+                result = await createStream(apiRetryModel);
               } else {
                 throw error;
               }
             }
 
-            writer.merge(
+            const mergePrimaryStream = (
+              stream: Parameters<typeof writer.merge>[0],
+            ) => {
+              writer.merge(
+                stream.pipeThrough(
+                  createRecoverableProviderErrorFilter(
+                    () =>
+                      !isRetryWithFallback &&
+                      shouldRetryAbliterationError(
+                        activeAbliteratedExperiment,
+                        activeModelName,
+                        userStopSignal.signal,
+                      ),
+                  ),
+                ),
+              );
+            };
+
+            mergePrimaryStream(
               result.toUIMessageStream({
+                onError: formatToolStreamError,
                 generateMessageId: () => assistantMessageId,
                 messageMetadata: ({ part }) => {
                   if (part.type === "start") {
@@ -1377,6 +1906,7 @@ export const createChatHandler = () => {
                 },
                 onFinish: async ({ messages, isAborted }) => {
                   let retryScheduled = false;
+                  let visionSummaryRecoveryFailure: unknown;
                   try {
                     const lastAssistantMessage = messages
                       .slice()
@@ -1394,8 +1924,38 @@ export const createChatHandler = () => {
                     const stoppedDueToAssistantContentLoop =
                       state.stoppedDueToAssistantContentLoop ||
                       (!isAborted && assistantContentLoopDetection.detected);
+                    const providerContentBlocked =
+                      isProviderContentFilterFinishReason(
+                        state.streamFinishReason,
+                      );
                     const hasTerminalProviderStreamError =
-                      state.streamFinishReason === "error";
+                      state.streamFinishReason === "error" ||
+                      providerContentBlocked ||
+                      state.providerError != null;
+                    const shouldRecoverAbliterationStreamError =
+                      hasTerminalProviderStreamError &&
+                      shouldRetryAbliterationError(
+                        activeAbliteratedExperiment,
+                        activeModelName,
+                        userStopSignal.signal,
+                      );
+                    const shouldRetryReasoningOnlyProviderError =
+                      shouldRetryProviderStreamAfterReasoningOnlyOutput(
+                        lastAssistantMessageParts,
+                        { hasTerminalProviderStreamError },
+                      );
+                    const shouldRetryNonDurableOutputLimit =
+                      shouldRetryProviderStreamAfterNonDurableOutputLimit(
+                        lastAssistantMessageParts,
+                        { finishReason: state.streamFinishReason },
+                      );
+                    const shouldRetryExplicitDeepSeekProReasoning =
+                      shouldRetryReasoningOnlyProviderError &&
+                      isExplicitDeepSeekProSelectionForRetry({
+                        selectedModel: retrySelectionModel,
+                        selectedModelOverride,
+                        mode,
+                      });
                     const shouldRetryInterruptedToolInput =
                       shouldRetryProviderStreamAfterInterruptedToolInput(
                         lastAssistantMessageParts,
@@ -1407,6 +1967,8 @@ export const createChatHandler = () => {
                         {
                           hasTerminalProviderStreamError:
                             hasTerminalProviderStreamError,
+                          finishReason: state.streamFinishReason,
+                          providerContentBlocked,
                           stoppedDueToDoomLoop: state.stoppedDueToDoomLoop,
                           stoppedDueToAssistantContentLoop,
                           detectAssistantContentLoop: !isAborted,
@@ -1417,36 +1979,160 @@ export const createChatHandler = () => {
                         ? omitImageViewToolResultsForProviderRetry(messages)
                         : { messages, omittedCount: 0 };
                     const shouldRetryWithoutImageToolResults =
-                      imageRecovery.omittedCount > 0 && !isAborted;
+                      imageRecovery.omittedCount > 0 &&
+                      !isAborted &&
+                      !shouldRecoverAbliterationStreamError;
+                    const hasImageAttachmentForRecovery =
+                      countFileAttachments(state.finalMessages).imageCount > 0;
+                    const hasImageToolResultForRecovery =
+                      uiMessagesContainImageViewResult(state.finalMessages);
+                    const shouldRetryWithVisionSummary =
+                      directGlmVisionEnabled &&
+                      !shouldRecoverAbliterationStreamError &&
+                      !visionSummaryRecovery.isEnabled() &&
+                      !providerContentBlocked &&
+                      hasTerminalProviderStreamError &&
+                      (shouldRetryWithFallback ||
+                        shouldRetryWithoutImageToolResults) &&
+                      (hasImageAttachmentForRecovery ||
+                        hasImageToolResultForRecovery);
+                    const visionSummaryRecoveryError =
+                      state.providerError ??
+                      new Error("Direct vision route failed");
 
                     if (
-                      shouldRetryWithFallback ||
-                      shouldRetryWithoutImageToolResults
+                      (shouldRecoverAbliterationStreamError ||
+                        shouldRetryWithFallback ||
+                        shouldRetryWithoutImageToolResults ||
+                        shouldRetryWithVisionSummary) &&
+                      !isRetryWithFallback
                     ) {
                       const loopTriggeredRetry =
                         stoppedDueToAssistantContentLoop ||
                         state.stoppedDueToDoomLoop;
-                      const retryReason = shouldRetryWithoutImageToolResults
-                        ? "image_tool_result_rejection"
-                        : stoppedDueToAssistantContentLoop
-                          ? "assistant_content_loop"
-                          : state.stoppedDueToDoomLoop
-                            ? "doom_loop"
-                            : shouldRetryInterruptedToolInput
-                              ? "interrupted_tool_input"
-                              : "incomplete_stream";
+                      const retryReason = shouldRetryWithVisionSummary
+                        ? "vision_summary_recovery"
+                        : shouldRetryWithoutImageToolResults
+                          ? "image_tool_result_rejection"
+                          : providerContentBlocked
+                            ? "content_filter"
+                            : stoppedDueToAssistantContentLoop
+                              ? "assistant_content_loop"
+                              : state.stoppedDueToDoomLoop
+                                ? "doom_loop"
+                                : shouldRetryInterruptedToolInput
+                                  ? "interrupted_tool_input"
+                                  : shouldRetryNonDurableOutputLimit
+                                    ? "non_durable_output_limit"
+                                    : shouldRetryReasoningOnlyProviderError
+                                      ? "reasoning_only_provider_error"
+                                      : "incomplete_stream";
+                      const blockedProviderModel = providerContentBlocked
+                        ? state.responseModel
+                        : undefined;
+                      const retryModel = shouldRecoverAbliterationStreamError
+                        ? fallbackModel
+                        : shouldRetryWithVisionSummary
+                          ? selectModel(
+                              mode,
+                              subscription,
+                              selectedModelOverride,
+                              false,
+                              false,
+                              { extraUsageAvailable },
+                            )
+                          : shouldRetryWithoutImageToolResults
+                            ? selectedModel
+                            : providerContentBlocked
+                              ? getContentFilterRetryModel(
+                                  selectedModel,
+                                  mode,
+                                  blockedProviderModel,
+                                  fallbackModel,
+                                )
+                              : fallbackModel;
+                      const retryModelSlug =
+                        trackedProvider.languageModel(retryModel).modelId;
+                      const shouldAttemptProviderRetry =
+                        (shouldRecoverAbliterationStreamError ||
+                          !(
+                            state.providerError instanceof
+                            AbliterationVisionError
+                          )) &&
+                        (!isAborted || stoppedDueToAssistantContentLoop) &&
+                        !userStopSignal.signal.aborted &&
+                        (isAutoModel ||
+                          shouldRecoverAbliterationStreamError ||
+                          shouldRetryWithVisionSummary ||
+                          providerContentBlocked ||
+                          shouldRetryWithoutImageToolResults ||
+                          loopTriggeredRetry ||
+                          shouldRetryInterruptedToolInput ||
+                          shouldRetryExplicitDeepSeekProReasoning);
+                      let recoveredVisionMessages:
+                        typeof state.finalMessages | undefined;
+                      if (
+                        shouldAttemptProviderRetry &&
+                        shouldRetryWithVisionSummary
+                      ) {
+                        visionSummaryRecovery.activate({
+                          error: visionSummaryRecoveryError,
+                          source: hasImageAttachmentForRecovery
+                            ? "attachment"
+                            : "file_view",
+                        });
+                        try {
+                          recoveredVisionMessages =
+                            await describeImageAttachmentsWithAuxiliaryVision({
+                              messages:
+                                omitImageViewToolResultsForProviderRetry(
+                                  state.finalMessages,
+                                ).messages,
+                              requestId,
+                              userId,
+                              chatId,
+                              abortSignal: userStopSignal.signal,
+                              onCost: (costDollars) => {
+                                usageTracker.providerCost += costDollars;
+                                usageTracker.nonModelCost += costDollars;
+                                chatLogger
+                                  ?.getBuilder()
+                                  .addToolCost(costDollars);
+                              },
+                              cacheDescription: cacheAuxiliaryVisionDescription,
+                            });
+                        } catch (summaryError) {
+                          visionSummaryRecoveryFailure = summaryError;
+                          phLogger.error("Vision summary recovery failed", {
+                            event: "vision_summary_recovery_failed",
+                            chatId,
+                            endpoint,
+                            mode,
+                            userId,
+                            subscription,
+                            ...extractErrorDetails(summaryError),
+                          });
+                        }
+                      }
                       phLogger.warn(
-                        shouldRetryWithoutImageToolResults
-                          ? "Provider rejected image tool output - retrying without images"
-                          : retryReason === "assistant_content_loop"
-                            ? "Assistant content loop detected - triggering fallback"
-                            : retryReason === "doom_loop"
-                              ? "Agent doom loop detected - triggering fallback"
-                              : retryReason === "interrupted_tool_input"
-                                ? "Provider stream errored during tool input - triggering bounded fallback"
-                                : hasTerminalProviderStreamError
-                                  ? "Provider stream errored before useful output - triggering fallback"
-                                  : "Stream finished incomplete - triggering fallback",
+                        shouldRetryWithVisionSummary
+                          ? "Direct vision routes failed - retrying with MiniMax summary"
+                          : shouldRetryWithoutImageToolResults
+                            ? "Provider rejected image tool output - retrying without images"
+                            : retryReason === "content_filter"
+                              ? "Provider content filter triggered fallback model retry"
+                              : retryReason === "assistant_content_loop"
+                                ? "Assistant content loop detected - triggering fallback"
+                                : retryReason === "doom_loop"
+                                  ? "Agent doom loop detected - triggering fallback"
+                                  : retryReason === "interrupted_tool_input"
+                                    ? "Provider stream errored during tool input - triggering bounded fallback"
+                                    : retryReason ===
+                                        "reasoning_only_provider_error"
+                                      ? "Provider stream errored after reasoning-only output - triggering bounded fallback"
+                                      : hasTerminalProviderStreamError
+                                        ? "Provider stream errored before useful output - triggering fallback"
+                                        : "Stream finished incomplete - triggering fallback",
                         {
                           chatId,
                           endpoint,
@@ -1454,36 +2140,48 @@ export const createChatHandler = () => {
                           model: selectedModel,
                           userId,
                           subscription,
-                          isTemporary: temporary,
                           messageCount: messages.length,
                           parts: lastAssistantMessage?.parts,
                           isRetryWithFallback,
                           assistantMessageId,
                           retryReason,
+                          blockedProviderModel,
+                          retryModel,
+                          retryModelSlug,
                           stoppedDueToDoomLoop: state.stoppedDueToDoomLoop,
                           assistantContentLoop:
                             assistantContentLoopDetection.detected
                               ? assistantContentLoopDetection
                               : undefined,
                           shouldRetryInterruptedToolInput,
+                          shouldRetryNonDurableOutputLimit,
                           imageToolResultsOmitted: imageRecovery.omittedCount,
+                          visionSummaryRecovery: shouldRetryWithVisionSummary,
                         },
                       );
 
-                      // Retry with fallback model for incomplete or reasoning-only
-                      // terminal provider streams. For image-tool rejection, retry
-                      // the same selected model after replacing image outputs with
-                      // text placeholders.
+                      // Retry with the fallback model for content-filter,
+                      // incomplete, or reasoning-only terminal provider streams.
+                      // For image-tool rejection, retry the same selected model
+                      // after replacing image outputs with text placeholders.
+                      const retryMessageId = generateId();
                       if (
-                        !isRetryWithFallback &&
-                        (!isAborted || stoppedDueToAssistantContentLoop) &&
-                        (isAutoModel ||
-                          shouldRetryWithoutImageToolResults ||
-                          loopTriggeredRetry ||
-                          shouldRetryInterruptedToolInput)
+                        shouldAttemptProviderRetry &&
+                        !visionSummaryRecoveryFailure &&
+                        !userStopSignal.signal.aborted
+                      ) {
+                        await taskOutcomeSurvey?.linkMessage(retryMessageId);
+                      }
+                      isAborted ||= userStopSignal.signal.aborted;
+
+                      if (
+                        shouldAttemptProviderRetry &&
+                        !visionSummaryRecoveryFailure &&
+                        !userStopSignal.signal.aborted
                       ) {
                         isRetryWithFallback = true;
                         state.lastStepInputTokens = 0;
+                        state.stoppedDueToStepLimit = false;
                         state.streamFinishReason = undefined;
                         state.providerError = undefined;
                         state.providerRejectedMultimodalToolResults = false;
@@ -1503,15 +2201,42 @@ export const createChatHandler = () => {
                         preFallbackCacheRead = usageTracker.cacheReadTokens;
                         preFallbackCacheWrite = usageTracker.cacheWriteTokens;
 
-                        const retryModel = shouldRetryWithoutImageToolResults
-                          ? selectedModel
-                          : fallbackModel;
-                        retryUsedFallbackModel = retryUsesDifferentModel(
-                          selectedModel,
-                          retryModel,
-                        );
+                        retryUsedFallbackModel =
+                          retryUsesDifferentModel(selectedModel, retryModel) ||
+                          providerContentBlocked;
                         resetServedModelTelemetryForRetry(state);
-                        if (shouldRetryWithoutImageToolResults) {
+                        if (shouldRecoverAbliterationStreamError) {
+                          const continuation =
+                            prepareProviderDisconnectContinuation(messages, {
+                              allowCompletedTail: true,
+                            });
+                          if (!continuation?.preservedCompletedToolCount) {
+                            usageTracker.resetModelLeg();
+                          }
+                          if (
+                            continuation &&
+                            (continuation.preservedCompletedToolCount > 0 ||
+                              continuation.preservedUnknownToolCount > 0)
+                          ) {
+                            state.finalMessages = [
+                              ...state.finalMessages,
+                              ...continuation.messages,
+                              {
+                                id: generateId(),
+                                role: "user",
+                                parts: [
+                                  {
+                                    type: "text",
+                                    text: PROVIDER_DISCONNECT_CONTINUATION_PROMPT,
+                                  },
+                                ],
+                              },
+                            ];
+                          }
+                        } else if (shouldRetryWithVisionSummary) {
+                          state.finalMessages = recoveredVisionMessages!;
+                          usageTracker.resetModelLeg();
+                        } else if (shouldRetryWithoutImageToolResults) {
                           state.finalMessages =
                             omitTrailingStepStartAssistantMessage(
                               imageRecovery.messages,
@@ -1523,11 +2248,17 @@ export const createChatHandler = () => {
                           usageTracker.resetModelLeg();
                         }
 
-                        const retryResult = await createStream(retryModel);
-                        const retryMessageId = generateId();
+                        abliteratedTelemetry?.setMessageId(retryMessageId);
+                        const retryResult = await createStream(
+                          retryModel,
+                          blockedProviderModel
+                            ? [blockedProviderModel]
+                            : undefined,
+                        );
 
                         writer.merge(
                           retryResult.toUIMessageStream({
+                            onError: formatToolStreamError,
                             generateMessageId: () => retryMessageId,
                             messageMetadata: ({ part }) => {
                               if (part.type === "start") {
@@ -1587,14 +2318,33 @@ export const createChatHandler = () => {
                                   userId,
                                   mode,
                                 });
+                                await drainBackgroundStreamWork();
                                 // Final reconciliation can change the finish
                                 // reason to budget-exhausted; do it before
                                 // analytics and persistence consume state.
-                                await deductAccumulatedUsage();
+                                await deductAccumulatedUsage(retryMessageId);
+                                const providerContentBlocked =
+                                  isProviderContentFilterFinishReason(
+                                    state.streamFinishReason,
+                                  );
                                 const outcome = retryAborted
                                   ? "aborted"
-                                  : "success";
+                                  : providerContentBlocked
+                                    ? "error"
+                                    : "success";
                                 captureAgentCompletionAnalytics({
+                                  cacheHistoryTelemetry:
+                                    state.cacheHistoryTelemetry,
+                                  usageMeasurement:
+                                    usageTracker.measurementProperties(
+                                      selectedModel,
+                                    ),
+                                  hasResponseContent: hasCompletedAssistantText(
+                                    retryMessages,
+                                    retryMessageId,
+                                  ),
+                                  abliteratedProviderSummary:
+                                    abliteratedTelemetry?.getSummary(),
                                   posthog,
                                   userId,
                                   chatId,
@@ -1603,6 +2353,17 @@ export const createChatHandler = () => {
                                   subscription,
                                   sandboxInfo,
                                   outcome,
+                                  abortSource: resolveAgentAbortSource({
+                                    outcome,
+                                    stoppedDueToBudgetExhaustion:
+                                      state.stoppedDueToBudgetExhaustion,
+                                    stoppedDueToAgentRunSpendCap:
+                                      state.stoppedDueToAgentRunSpendCap,
+                                    stoppedDueToElapsedTimeout:
+                                      state.stoppedDueToElapsedTimeout,
+                                    userStopRequested:
+                                      userStopSignal.signal.aborted,
+                                  }),
                                   chatLogger,
                                   selectedModel,
                                   configuredModelId,
@@ -1614,26 +2375,37 @@ export const createChatHandler = () => {
                                       : state.fallbackServed,
                                   finishReason: state.streamFinishReason,
                                   budgetAbortDetails: state.budgetAbortDetails,
-                                  isAutoContinue,
-                                  completionSignals:
-                                    buildAgentCompletionSignals({
-                                      outcome,
-                                      finishReason: state.streamFinishReason,
-                                      todos: getTodoManager().getAllTodos(),
-                                      tracker: completionSignalTracker,
+                                  isAutoContinue: !!isAutoContinue,
+                                  experiment: routingExperimentContext,
+                                  stepLimitTelemetry:
+                                    buildAgentStepLimitTelemetry({
+                                      configuredMaxSteps:
+                                        state.configuredMaxSteps,
+                                      stepCount: state.agentStepCount,
+                                      stepLimitReached:
+                                        state.stoppedDueToStepLimit,
+                                      todoRunMetrics:
+                                        getTodoManager().getRunMetrics(),
                                     }),
                                 });
-                                chatLogger!.emitSuccess({
-                                  finishReason: state.streamFinishReason,
-                                  wasAborted: retryAborted,
-                                  wasPreemptiveTimeout: false,
-                                  hadSummarization:
-                                    summarizationTracker.hasSummarized,
-                                });
+                                if (providerContentBlocked) {
+                                  chatLogger!.emitUnexpectedError(
+                                    state.providerError ??
+                                      createProviderContentBlockedFinishReasonError(),
+                                  );
+                                } else {
+                                  chatLogger!.emitSuccess({
+                                    finishReason: state.streamFinishReason,
+                                    wasAborted: retryAborted,
+                                    wasPreemptiveTimeout: false,
+                                    hadSummarization:
+                                      summarizationTracker.hasSummarized,
+                                  });
+                                }
 
                                 const generatedTitle = await titlePromise;
 
-                                if (!temporary) {
+                                {
                                   const mergedTodos =
                                     getTodoManager().mergeWith(
                                       baseTodos,
@@ -1686,19 +2458,25 @@ export const createChatHandler = () => {
                                       generationTimeMs:
                                         Date.now() - fallbackStartTime,
                                       finishReason: state.streamFinishReason,
+                                      userInitiatedAbort:
+                                        retryAborted &&
+                                        !(
+                                          preemptiveTimeout?.isPreemptive() ??
+                                          false
+                                        ) &&
+                                        !state.stoppedDueToBudgetExhaustion &&
+                                        !state.stoppedDueToAgentRunSpendCap &&
+                                        !state.stoppedDueToElapsedTimeout,
+                                      abliterationRouting:
+                                        abliteratedTelemetry?.getRoutingMarker(
+                                          !retryAborted &&
+                                            state.streamFinishReason === "stop",
+                                        ),
                                     });
                                   }
 
                                   // Send file metadata via stream for resumable stream clients
                                   sendFileMetadataToStream(accumulatedFiles);
-                                } else {
-                                  // For temporary chats, send file metadata via stream before cleanup
-                                  const tempFiles =
-                                    getFileAccumulator().getAll();
-                                  sendFileMetadataToStream(tempFiles);
-
-                                  // Ensure temp stream row is removed backend-side
-                                  await deleteTempStreamForBackend({ chatId });
                                 }
 
                                 // Verify fallback produced valid content
@@ -1745,9 +2523,6 @@ export const createChatHandler = () => {
                                       : null,
                                   userId,
                                   subscription,
-                                  isTemporary: temporary,
-                                  paidAskMode:
-                                    mode === "ask" && subscription !== "free",
                                   retryReason,
                                   imageToolResultsOmitted:
                                     imageRecovery.omittedCount,
@@ -1771,11 +2546,6 @@ export const createChatHandler = () => {
                       preemptiveTimeout?.isPreemptive() ?? false;
                     const onFinishStartTime = Date.now();
                     const triggerTime = preemptiveTimeout?.getTriggerTime();
-                    const cleanupRequestId =
-                      req.headers.get("x-request-id") ??
-                      req.headers.get("x-vercel-id") ??
-                      undefined;
-
                     const logCleanupStage = ({
                       phase,
                       step,
@@ -1789,6 +2559,7 @@ export const createChatHandler = () => {
 
                       console.info(
                         JSON.stringify({
+                          ...chatLogger?.getDiagnosticContext(),
                           timestamp: new Date().toISOString(),
                           level: "info",
                           event: "preemptive_timeout_cleanup_stage",
@@ -1797,7 +2568,7 @@ export const createChatHandler = () => {
                             process.env.VERCEL_ENV ??
                             process.env.NODE_ENV ??
                             "unknown",
-                          request_id: cleanupRequestId,
+                          request_id: requestId,
                           user_id: userId,
                           chat_id: chatId,
                           endpoint,
@@ -1836,6 +2607,7 @@ export const createChatHandler = () => {
                         const totalElapsed =
                           Date.now() - (triggerTime || onFinishStartTime);
                         phLogger.info("Preemptive timeout cleanup step", {
+                          ...chatLogger?.getDiagnosticContext(),
                           chatId,
                           step,
                           stepDurationMs: stepDuration,
@@ -1847,13 +2619,13 @@ export const createChatHandler = () => {
 
                     if (isPreemptiveAbort) {
                       phLogger.info("Preemptive timeout onFinish started", {
+                        ...chatLogger?.getDiagnosticContext(),
                         chatId,
                         endpoint,
                         timeSinceTriggerMs: triggerTime
                           ? onFinishStartTime - triggerTime
                           : null,
                         messageCount: messages.length,
-                        isTemporary: temporary,
                       });
                     }
 
@@ -1889,12 +2661,31 @@ export const createChatHandler = () => {
                       cacheWriteTokens: usageTracker.cacheWriteTokens,
                     });
                     captureToolCalls({ posthog, chatLogger, userId, mode });
+                    await drainBackgroundStreamWork();
                     // Final reconciliation can change the finish reason to
                     // budget-exhausted; do it before analytics and persistence
                     // consume state.
                     await deductAccumulatedUsage();
-                    const outcome = isAborted ? "aborted" : "success";
+                    const finalProviderContentBlocked =
+                      isProviderContentFilterFinishReason(
+                        state.streamFinishReason,
+                      );
+                    const outcome = isAborted
+                      ? "aborted"
+                      : finalProviderContentBlocked ||
+                          visionSummaryRecoveryFailure
+                        ? "error"
+                        : "success";
                     captureAgentCompletionAnalytics({
+                      cacheHistoryTelemetry: state.cacheHistoryTelemetry,
+                      usageMeasurement:
+                        usageTracker.measurementProperties(selectedModel),
+                      hasResponseContent: hasCompletedAssistantText(
+                        messages,
+                        assistantMessageId,
+                      ),
+                      abliteratedProviderSummary:
+                        abliteratedTelemetry?.getSummary(),
                       posthog,
                       userId,
                       chatId,
@@ -1903,6 +2694,16 @@ export const createChatHandler = () => {
                       subscription,
                       sandboxInfo,
                       outcome,
+                      abortSource: resolveAgentAbortSource({
+                        outcome,
+                        stoppedDueToBudgetExhaustion:
+                          state.stoppedDueToBudgetExhaustion,
+                        stoppedDueToAgentRunSpendCap:
+                          state.stoppedDueToAgentRunSpendCap,
+                        stoppedDueToElapsedTimeout:
+                          state.stoppedDueToElapsedTimeout,
+                        userStopRequested: userStopSignal.signal.aborted,
+                      }),
                       chatLogger,
                       selectedModel,
                       configuredModelId,
@@ -1913,20 +2714,32 @@ export const createChatHandler = () => {
                           : state.fallbackServed,
                       finishReason: state.streamFinishReason,
                       budgetAbortDetails: state.budgetAbortDetails,
-                      isAutoContinue,
-                      completionSignals: buildAgentCompletionSignals({
-                        outcome,
-                        finishReason: state.streamFinishReason,
-                        todos: getTodoManager().getAllTodos(),
-                        tracker: completionSignalTracker,
+                      isAutoContinue: !!isAutoContinue,
+                      experiment: routingExperimentContext,
+                      stepLimitTelemetry: buildAgentStepLimitTelemetry({
+                        configuredMaxSteps: state.configuredMaxSteps,
+                        stepCount: state.agentStepCount,
+                        stepLimitReached: state.stoppedDueToStepLimit,
+                        todoRunMetrics: getTodoManager().getRunMetrics(),
                       }),
                     });
-                    chatLogger!.emitSuccess({
-                      finishReason: state.streamFinishReason,
-                      wasAborted: isAborted,
-                      wasPreemptiveTimeout: isPreemptiveAbort,
-                      hadSummarization: summarizationTracker.hasSummarized,
-                    });
+                    if (visionSummaryRecoveryFailure) {
+                      chatLogger!.emitUnexpectedError(
+                        visionSummaryRecoveryFailure,
+                      );
+                    } else if (finalProviderContentBlocked) {
+                      chatLogger!.emitUnexpectedError(
+                        state.providerError ??
+                          createProviderContentBlockedFinishReasonError(),
+                      );
+                    } else {
+                      chatLogger!.emitSuccess({
+                        finishReason: state.streamFinishReason,
+                        wasAborted: isAborted,
+                        wasPreemptiveTimeout: isPreemptiveAbort,
+                        hadSummarization: summarizationTracker.hasSummarized,
+                      });
+                    }
                     logStep("settle_usage_and_emit_success", stepStart);
 
                     // Sandbox cleanup is automatic with auto-pause
@@ -1938,7 +2751,7 @@ export const createChatHandler = () => {
                     const generatedTitle = await titlePromise;
                     logStep("wait_title_generation", stepStart);
 
-                    if (!temporary) {
+                    {
                       stepStart = beginStep("merge_todos");
                       const mergedTodos = getTodoManager().mergeWith(
                         baseTodos,
@@ -2079,6 +2892,7 @@ export const createChatHandler = () => {
                             has_usage_to_record: hasUsageToRecord,
                           }),
                         );
+                        await drainBackgroundStreamWork();
                         await deductAccumulatedUsage();
                         shutdownPostHog(posthog);
                         return;
@@ -2120,6 +2934,12 @@ export const createChatHandler = () => {
                             generationTimeMs: Date.now() - streamStartTime,
                             finishReason: state.streamFinishReason,
                             usage: resolvedUsage ?? state.streamUsage,
+                            abliterationRouting:
+                              abliteratedTelemetry?.getRoutingMarker(
+                                !isAborted &&
+                                  state.streamFinishReason === "stop",
+                              ),
+                            userInitiatedAbort: isUserInitiatedAbort,
                             updateOnly: shouldUseUpdateOnlyForAbortedSave({
                               isAborted,
                               isUserInitiatedAbort,
@@ -2180,17 +3000,6 @@ export const createChatHandler = () => {
                       stepStart = beginStep("send_file_metadata");
                       sendFileMetadataToStream(accumulatedFiles);
                       logStep("send_file_metadata", stepStart);
-                    } else {
-                      // For temporary chats, send file metadata via stream before cleanup
-                      stepStart = beginStep("send_temp_file_metadata");
-                      const tempFiles = getFileAccumulator().getAll();
-                      sendFileMetadataToStream(tempFiles);
-                      logStep("send_temp_file_metadata", stepStart);
-
-                      // Ensure temp stream row is removed backend-side
-                      stepStart = beginStep("delete_temp_stream");
-                      await deleteTempStreamForBackend({ chatId });
-                      logStep("delete_temp_stream", stepStart);
                     }
 
                     if (isPreemptiveAbort) {
@@ -2210,18 +3019,17 @@ export const createChatHandler = () => {
 
                     const autoContinueStopSource =
                       getAgentAutoContinueStopSource({
+                        stoppedDueToStepLimit: state.stoppedDueToStepLimit,
                         finishReason: state.streamFinishReason,
                         stoppedDueToTokenExhaustion:
                           state.stoppedDueToTokenExhaustion,
-                        stoppedDueToElapsedTimeout:
-                          state.stoppedDueToElapsedTimeout,
                         stoppedDueToPostSummarizationIncomplete:
                           state.stoppedDueToPostSummarizationIncomplete,
                       });
                     if (
                       autoContinueStopSource &&
                       isAgentMode(mode) &&
-                      !temporary
+                      !isAutomaticContinuation
                     ) {
                       writeAutoContinue(writer);
                       phLogger.info("Agent auto-continue signaled", {
@@ -2232,6 +3040,19 @@ export const createChatHandler = () => {
                         stop_source: autoContinueStopSource,
                         last_step_input_tokens: state.lastStepInputTokens,
                         had_summarization: summarizationTracker.hasSummarized,
+                      });
+                    } else if (
+                      autoContinueStopSource &&
+                      isAgentMode(mode) &&
+                      isAutomaticContinuation
+                    ) {
+                      phLogger.info("Agent auto-continue limit reached", {
+                        event: "agent_auto_continue_suppressed",
+                        chat_id: chatId,
+                        assistant_id: assistantMessageId,
+                        finish_reason: state.streamFinishReason,
+                        stop_source: autoContinueStopSource,
+                        reason: "continuation_run",
                       });
                     }
                     shutdownPostHog(posthog);
@@ -2245,7 +3066,48 @@ export const createChatHandler = () => {
               }),
             );
           } catch (error) {
-            await releaseFreeRunLockOnce();
+            // execute errors are consumed by createUIMessageStream, so the
+            // outer request catch and stream onFinish cannot clean them up.
+            preemptiveTimeout?.clear();
+            if (!paidDailyFreeAllowanceUsageTracker?.hasUsage) {
+              await releasePaidDailyFreeAllowanceReservation();
+            }
+            const cleanupOperations = [
+              [
+                "stop_subscriber",
+                async () => {
+                  if (!subscriberStopped) {
+                    await cancellationSubscriber.stop();
+                    subscriberStopped = true;
+                  }
+                },
+              ],
+              ["refund_usage", () => usageRefundTracker.refund()],
+              ["close_pty_sessions", () => ptySessionManager.closeAll(chatId)],
+              ["release_run_lock", () => releaseFreeRunLockOnce()],
+            ] as const;
+            const cleanupResults = await Promise.allSettled(
+              cleanupOperations.map(async ([, cleanup]) => cleanup()),
+            );
+            const failedOperations = cleanupOperations
+              .filter((_, index) => cleanupResults[index].status === "rejected")
+              .map(([operation]) => operation);
+            if (failedOperations.length > 0) {
+              phLogger.warn("Chat stream setup cleanup failed", {
+                event: "chat_stream_setup_cleanup_failed",
+                chatId,
+                endpoint,
+                failed_operations: failedOperations,
+              });
+            }
+            shutdownPostHog(posthog);
+            if (
+              userStopSignal.signal.aborted &&
+              error === userStopSignal.signal.reason
+            ) {
+              writer.write({ type: "abort" });
+              return;
+            }
             throw error;
           }
         },
@@ -2257,11 +3119,6 @@ export const createChatHandler = () => {
           "Transfer-Encoding": "chunked",
         },
         async consumeSseStream({ stream: sseStream }) {
-          // Temporary chats do not support resumption
-          if (temporary) {
-            return;
-          }
-
           try {
             const streamContext = getStreamContext();
             if (streamContext) {
@@ -2284,6 +3141,9 @@ export const createChatHandler = () => {
     } catch (error) {
       // Clear timeout if error occurs before onFinish
       preemptiveTimeout?.clear();
+      if (!paidDailyFreeAllowanceUsageTracker?.hasUsage) {
+        await releasePaidDailyFreeAllowanceReservation();
+      }
       await releaseFreeRunLockOnce();
       shutdownPostHog(posthog);
 

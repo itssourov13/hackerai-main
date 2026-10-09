@@ -1,5 +1,7 @@
-import { Centrifuge, type Subscription } from "centrifuge";
+import { OperationChannelRouter } from "@/packages/local/src/operation-channels";
+import { Centrifuge, errorCodes, type Subscription } from "centrifuge";
 import { captureAuthenticatedEvent } from "@/lib/analytics/client";
+import { DesktopRelayTelemetry } from "@/lib/analytics/desktop-relay";
 import {
   sandboxConnectionChannel,
   type SandboxMessage,
@@ -21,6 +23,12 @@ import {
   DEFAULT_PTY_COLS,
   DEFAULT_PTY_ROWS,
 } from "@/lib/ai/tools/utils/pty-session-manager";
+import {
+  CentrifugoMessageReassembler,
+  CentrifugoPublishQueue,
+} from "@/packages/local/src/centrifugo-transport";
+import { buildCentrifugoTransportConfig } from "@/packages/local/src/centrifugo-endpoints";
+import { LOCAL_SANDBOX_HEARTBEAT_INTERVAL_MS } from "@/lib/centrifugo/presence";
 
 type RefreshTokenResult =
   | { ok: true; centrifugoToken: string }
@@ -38,6 +46,7 @@ type RefreshTokenResult =
         | "desktop_kicked_by_new_session"
         | "token_regenerated"
         | "presence_sweep"
+        | "command_unresponsive"
         | null;
       msSinceDisconnected: number | null;
       msSinceLastHeartbeat: number | null;
@@ -48,13 +57,99 @@ type DesktopBridgeTerminationReason =
   | "unauthenticated"
   | "connection_not_found"
   | "ownership_mismatch"
-  | "connection_inactive";
+  | "session_replaced"
+  | "connection_inactive"
+  | "transport_disconnected";
+
+type DesktopBridgeConnectionState = "connecting" | "connected";
+
+function terminationReason(
+  result: Extract<RefreshTokenResult, { ok: false }>,
+): DesktopBridgeTerminationReason {
+  return result.reason === "connection_inactive" &&
+    result.disconnectReason === "desktop_kicked_by_new_session"
+    ? "session_replaced"
+    : result.reason;
+}
+
+type DesktopStreamPublishFailureReason = "connection_closed" | "timeout";
+
+const DESKTOP_STREAM_PUBLISH_MAX_ATTEMPTS = 3;
+const DESKTOP_STREAM_PUBLISH_RETRY_BASE_DELAY_MS = 250;
+const DESKTOP_STREAM_RECONNECT_WAIT_MS = 5_000;
+const DESKTOP_STREAM_RECOVERY_DEADLINE_BUFFER_MS = 3_000;
+const DESKTOP_BRIDGE_READY_TIMEOUT_MS = 15_000;
+const DESKTOP_FILE_PROBE_TIMEOUT_MS = 3_000;
+
+/** Recognize browser transport failures without swallowing native filesystem errors. */
+function isFileTransportError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^(load failed|failed to fetch|fetch failed|networkerror.*|network request failed)$/i.test(
+    message,
+  );
+}
 
 interface StreamChunk {
   type: "stdout" | "stderr" | "exit" | "error";
   data?: string;
   exitCode?: number;
   message?: string;
+}
+
+interface DesktopStreamPublishRecoveryState {
+  failureReported: boolean;
+  recoveryReported: boolean;
+  exhaustionReported: boolean;
+  observedChunks: number;
+  publishedChunks: number;
+  exhaustedChunks: number;
+  terminalChunkObserved: "exit" | "error" | null;
+  terminalChunkPublished: boolean;
+}
+
+type DesktopStreamTelemetryContext = Pick<
+  CommandMessage,
+  "chatId" | "triggerRunId"
+>;
+
+function shouldForwardStreamChunk(chunk: StreamChunk): boolean {
+  if (chunk.type === "stdout" || chunk.type === "stderr") {
+    return Boolean(chunk.data);
+  }
+  return true;
+}
+
+function classifyDesktopStreamPublishFailure(
+  error: unknown,
+): DesktopStreamPublishFailureReason | null {
+  let code: unknown;
+  let message: unknown;
+
+  if (error instanceof Error) {
+    message = error.message;
+    try {
+      const parsed = JSON.parse(error.message) as unknown;
+      if (typeof parsed === "object" && parsed !== null) {
+        code = (parsed as { code?: unknown }).code;
+        message = (parsed as { message?: unknown }).message;
+      }
+    } catch {
+      // Centrifuge can also reject with a normal Error message.
+    }
+  } else if (typeof error === "object" && error !== null) {
+    code = (error as { code?: unknown }).code;
+    message = (error as { message?: unknown }).message;
+  } else {
+    message = error;
+  }
+
+  if (code === errorCodes.connectionClosed || message === "connection closed") {
+    return "connection_closed";
+  }
+  if (code === errorCodes.timeout || message === "timeout") {
+    return "timeout";
+  }
+  return null;
 }
 
 type TargetedIncomingMessage =
@@ -105,6 +200,7 @@ function isUnauthenticatedError(error: unknown): boolean {
 
 interface DesktopBridgeConfig {
   connectDesktop: (args: {
+    environmentId?: string;
     connectionName: string;
     osInfo?: {
       platform: string;
@@ -116,6 +212,7 @@ interface DesktopBridgeConfig {
       commands: boolean;
       pty: boolean;
       files?: boolean;
+      operationChannels?: boolean;
     };
   }) => Promise<{
     connectionId: string;
@@ -128,17 +225,37 @@ interface DesktopBridgeConfig {
   disconnectDesktop: (args: {
     connectionId: string;
   }) => Promise<{ success: boolean }>;
+  heartbeatDesktop: (args: {
+    connectionId: string;
+  }) => Promise<{ success: boolean }>;
+  onConnectionState?: (state: DesktopBridgeConnectionState) => void;
   onTerminated?: (reason: DesktopBridgeTerminationReason) => void;
 }
 
 export class DesktopSandboxBridge {
+  private environmentId?: string;
+
+  getEnvironmentId(): string | undefined {
+    return this.environmentId;
+  }
   private client: Centrifuge | null = null;
   private subscription: Subscription | null = null;
   private connectionId: string | null = null;
   private activeCommands = new Set<string>();
   private isStoppingOrStopped = true;
+  private startupGeneration = 0;
   private config: DesktopBridgeConfig;
+  private publishQueue: CentrifugoPublishQueue | null = null;
+  private operationRouter: OperationChannelRouter<Subscription> | null = null;
+  private nativeFileIpcAvailable: boolean | null = null;
 
+  private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  private consecutiveHeartbeatFailures = 0;
+  private relayUnavailableAt: number | null = null;
+  private successfulRelayConnections = 0;
+  private readonly relayTelemetry = new DesktopRelayTelemetry(
+    captureAuthenticatedEvent,
+  );
   constructor(config: DesktopBridgeConfig) {
     this.config = config;
   }
@@ -147,13 +264,117 @@ export class DesktopSandboxBridge {
     return this.connectionId;
   }
 
+  private logRelayState(
+    state: "connecting" | "connected" | "disconnected" | "error",
+    details: Record<string, unknown> = {},
+  ): void {
+    const properties = {
+      connectionId: this.connectionId,
+      clientSurface: "desktop_bridge",
+      state,
+      reconnectAttempt: Math.max(0, this.successfulRelayConnections - 1),
+      ...details,
+    };
+    const message = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event: "desktop_bridge_relay_state_changed",
+      ...properties,
+    });
+    if (state === "connected") {
+      console.info("[desktop-bridge]", message);
+    } else {
+      console.warn("[desktop-bridge]", message);
+    }
+    this.relayTelemetry.record(
+      state === "error"
+        ? "desktop_bridge_relay_error"
+        : "desktop_bridge_relay_state_changed",
+      properties,
+    );
+  }
+
+  private async sendHeartbeat(): Promise<void> {
+    const connectionId = this.connectionId;
+    if (this.isStoppingOrStopped || !connectionId) return;
+
+    try {
+      const result = await this.config.heartbeatDesktop({ connectionId });
+      if (this.isStoppingOrStopped || this.connectionId !== connectionId)
+        return;
+      if (!result.success) {
+        // The legacy heartbeat response has no reason. Resolve it through the
+        // existing token endpoint so a displaced session cannot kick its replacement.
+        const state = await this.config.refreshCentrifugoTokenDesktop({
+          connectionId,
+        });
+        if (this.isStoppingOrStopped || this.connectionId !== connectionId)
+          return;
+        this.logRelayState("disconnected", {
+          reason: "heartbeat_connection_inactive",
+        });
+        this.terminateClient(
+          state.ok ? "connection_inactive" : terminationReason(state),
+        );
+        return;
+      }
+      if (this.consecutiveHeartbeatFailures > 0) {
+        this.logRelayState("connected", {
+          source: "heartbeat",
+          recoveredAfterFailures: this.consecutiveHeartbeatFailures,
+        });
+        this.consecutiveHeartbeatFailures = 0;
+      }
+    } catch (error) {
+      if (this.isStoppingOrStopped) return;
+      if (isUnauthenticatedError(error)) {
+        this.logRelayState("disconnected", {
+          reason: "heartbeat_unauthenticated",
+        });
+        this.terminateClient("unauthenticated");
+        return;
+      }
+      this.consecutiveHeartbeatFailures += 1;
+      if (
+        this.consecutiveHeartbeatFailures === 1 ||
+        this.consecutiveHeartbeatFailures % 4 === 0
+      ) {
+        this.logRelayState("error", {
+          errorType: "heartbeat",
+          consecutiveFailures: this.consecutiveHeartbeatFailures,
+          error:
+            error instanceof Error ? error.message : String(error ?? "unknown"),
+        });
+      }
+    }
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    void this.sendHeartbeat();
+    this.heartbeatInterval = setInterval(() => {
+      void this.sendHeartbeat();
+    }, LOCAL_SANDBOX_HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+  }
+
   private terminateClient(reason: DesktopBridgeTerminationReason): void {
     if (this.isStoppingOrStopped) return;
     this.isStoppingOrStopped = true;
+    this.stopHeartbeat();
+    this.relayTelemetry.flush();
     const client = this.client;
     const subscription = this.subscription;
     this.client = null;
     this.subscription = null;
+    this.publishQueue = null;
+    this.operationRouter?.stop();
+    this.operationRouter = null;
     this.connectionId = null;
     try {
       subscription?.unsubscribe();
@@ -174,20 +395,62 @@ export class DesktopSandboxBridge {
   }
 
   async start(): Promise<string> {
+    const generation = ++this.startupGeneration;
+    const wasStopped = () =>
+      this.isStoppingOrStopped || generation !== this.startupGeneration;
     this.isStoppingOrStopped = false;
+    this.nativeFileIpcAvailable = null;
+    // Older desktop binaries do not expose identity yet. Keep their legacy
+    // registration path until the native update is installed.
+    const { invoke } = await import("@tauri-apps/api/core");
+    let environmentId: string | undefined;
+    try {
+      environmentId = await invoke<string>("get_environment_id");
+    } catch (error) {
+      if (
+        !String(error).includes("get_environment_id") ||
+        !/not found|unknown command|not registered|not allowed by acl/i.test(
+          String(error),
+        )
+      )
+        throw error;
+    }
+    this.environmentId = environmentId;
     const osInfo = await this.getOsInfo();
+    if (wasStopped()) throw new Error("Desktop bridge stopped during startup");
+    const files = await this.probeFileBridge();
+    if (wasStopped()) throw new Error("Desktop bridge stopped during startup");
 
     const { connectionId, centrifugoToken, centrifugoWsUrl } =
       await this.config.connectDesktop({
+        ...(environmentId ? { environmentId } : {}),
         connectionName: osInfo?.hostname || "Desktop",
         osInfo,
-        capabilities: { commands: true, pty: true, files: true },
+        capabilities: {
+          commands: true,
+          pty: true,
+          files,
+          operationChannels: true,
+        },
       });
+
+    if (wasStopped()) {
+      // stop() could not see this connection while registration was pending.
+      // Clean up only this attempt, without touching a newer start's relay.
+      void this.config.disconnectDesktop({ connectionId }).catch(() => {
+        console.warn(
+          "[DesktopSandboxBridge] Failed to disconnect canceled startup",
+        );
+      });
+      throw new Error("Desktop bridge stopped during startup");
+    }
 
     this.connectionId = connectionId;
 
-    this.client = new Centrifuge(centrifugoWsUrl, {
+    const transportConfig = buildCentrifugoTransportConfig(centrifugoWsUrl);
+    this.client = new Centrifuge(transportConfig.endpoints, {
       token: centrifugoToken,
+      emulationEndpoint: transportConfig.emulationEndpoint,
       getToken: async () => {
         if (!this.connectionId) {
           throw new Error(
@@ -242,18 +505,106 @@ export class DesktopSandboxBridge {
           eventProps,
         );
         captureAuthenticatedEvent("sandbox_connection_terminated", eventProps);
-        this.terminateClient(result.reason);
+        this.terminateClient(terminationReason(result));
         throw new Error(`Centrifugo refresh aborted: ${result.reason}`);
       },
     });
+    const client = this.client;
 
     const userId = this.extractUserIdFromToken(centrifugoToken);
     const channel = sandboxConnectionChannel(userId, connectionId);
-    this.subscription = this.client.newSubscription(channel);
+    const subscription = this.client.newSubscription(channel);
+    this.subscription = subscription;
+    this.publishQueue = new CentrifugoPublishQueue(async (message) => {
+      // Queued work can outlive stop() or a reconnect; never publish it on a
+      // replacement subscription.
+      if (this.isStoppingOrStopped || this.subscription !== subscription)
+        return;
+      await subscription.publish(message);
+    });
 
-    this.subscription.on("publication", (ctx) => {
-      const message = ctx.data;
+    client.on("connecting", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      if (this.relayUnavailableAt === null) {
+        this.relayUnavailableAt = Date.now();
+      }
+      this.config.onConnectionState?.("connecting");
+      this.logRelayState("connecting", {
+        code: ctx.code,
+        reason: ctx.reason,
+      });
+    });
+    client.on("connected", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      this.successfulRelayConnections += 1;
+      this.logRelayState("connected", {
+        transport: ctx.transport,
+        outageDurationMs:
+          this.relayUnavailableAt === null
+            ? 0
+            : Date.now() - this.relayUnavailableAt,
+      });
+      this.relayUnavailableAt = null;
+    });
+    client.on("disconnected", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      this.logRelayState("disconnected", {
+        code: ctx.code,
+        reason: ctx.reason,
+      });
+      this.terminateClient("transport_disconnected");
+    });
+    client.on("error", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      this.logRelayState("error", {
+        errorType: ctx.type,
+        code: ctx.error.code,
+        reason: ctx.error.message,
+        transport: ctx.transport,
+      });
+    });
 
+    subscription.on("subscribing", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      if (this.relayUnavailableAt === null) {
+        this.relayUnavailableAt = Date.now();
+      }
+      this.config.onConnectionState?.("connecting");
+      this.logRelayState("connecting", {
+        source: "subscription",
+        code: ctx.code,
+        reason: ctx.reason,
+      });
+    });
+    subscription.on("subscribed", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      this.config.onConnectionState?.("connected");
+      this.logRelayState("connected", {
+        source: "subscription",
+        recovered: ctx.recovered,
+        wasRecovering: ctx.wasRecovering,
+      });
+    });
+    subscription.on("unsubscribed", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      this.logRelayState("disconnected", {
+        source: "subscription",
+        code: ctx.code,
+        reason: ctx.reason,
+      });
+      this.terminateClient("transport_disconnected");
+    });
+    subscription.on("error", (ctx) => {
+      if (this.isStoppingOrStopped) return;
+      this.logRelayState("error", {
+        source: "subscription",
+        errorType: ctx.type,
+        code: ctx.error.code,
+        reason: ctx.error.message,
+      });
+    });
+
+    const handleIncoming = (message: unknown) => {
       if (!isTargetedIncomingMessage(message)) {
         return;
       }
@@ -342,10 +693,51 @@ export class DesktopSandboxBridge {
         default:
           break;
       }
+    };
+    const operationRouter = new OperationChannelRouter<Subscription>(
+      client,
+      userId,
+      connectionId,
+    );
+    this.operationRouter = operationRouter;
+    const reassembler = new CentrifugoMessageReassembler();
+    this.subscription.on("publication", (ctx) => {
+      const message = reassembler.accept(ctx.data);
+      if (
+        !message ||
+        this.isStoppingOrStopped ||
+        this.operationRouter !== operationRouter
+      )
+        return;
+      void operationRouter.dispatch(message, handleIncoming).catch((error) => {
+        console.error(
+          "[DesktopSandboxBridge] Operation subscription failed:",
+          error,
+        );
+      });
     });
 
     this.subscription.subscribe();
-    this.client.connect();
+    client.connect();
+
+    try {
+      await Promise.all([
+        client.ready(DESKTOP_BRIDGE_READY_TIMEOUT_MS),
+        subscription.ready(DESKTOP_BRIDGE_READY_TIMEOUT_MS),
+      ]);
+    } catch (error) {
+      this.logRelayState("error", {
+        errorType: "startup_readiness",
+        error:
+          error instanceof Error ? error.message : String(error ?? "unknown"),
+      });
+      throw error;
+    }
+    if (wasStopped() || this.connectionId !== connectionId) {
+      throw new Error("Desktop bridge stopped before relay became ready");
+    }
+    this.config.onConnectionState?.("connected");
+    this.startHeartbeat();
 
     return connectionId;
   }
@@ -433,14 +825,63 @@ export class DesktopSandboxBridge {
 
   private async handleCommand(command: CommandMessage): Promise<void> {
     const { commandId } = command;
+    const telemetryContext: DesktopStreamTelemetryContext = {
+      chatId: command.chatId,
+      triggerRunId: command.triggerRunId,
+    };
     this.activeCommands.add(commandId);
+    const commandStartedAt = Date.now();
+    const recoveryState: DesktopStreamPublishRecoveryState = {
+      failureReported: false,
+      recoveryReported: false,
+      exhaustionReported: false,
+      observedChunks: 0,
+      publishedChunks: 0,
+      exhaustedChunks: 0,
+      terminalChunkObserved: null,
+      terminalChunkPublished: false,
+    };
 
     try {
       const { invoke, Channel } = await import("@tauri-apps/api/core");
 
       const channel = new Channel<StreamChunk>();
-      channel.onmessage = async (chunk) => {
-        await this.forwardChunk(commandId, chunk);
+      const recoveryDeadlineAt =
+        Date.now() +
+        (command.timeout ?? 30_000) +
+        DESKTOP_STREAM_RECOVERY_DEADLINE_BUFFER_MS;
+      let nextSequence = 0;
+      let streamPublishTail: Promise<void> = Promise.resolve();
+
+      channel.onmessage = (chunk) => {
+        if (!shouldForwardStreamChunk(chunk)) return;
+
+        const sequence = nextSequence++;
+        recoveryState.observedChunks += 1;
+        if (chunk.type === "exit" || chunk.type === "error") {
+          recoveryState.terminalChunkObserved = chunk.type;
+        }
+        const operation = streamPublishTail.then(async () => {
+          try {
+            await this.forwardChunkWithRetry(
+              commandId,
+              chunk,
+              sequence,
+              recoveryState,
+              recoveryDeadlineAt,
+              telemetryContext,
+            );
+          } catch (error) {
+            // Tauri does not await Channel callbacks. Exhausted known
+            // transients are already reported above, so keep them from
+            // becoming one unhandled rejection per subsequent stream chunk.
+            // Unknown failures are logged before reaching this catch and
+            // remain rejected for callers that directly await this operation.
+            if (!classifyDesktopStreamPublishFailure(error)) throw error;
+          }
+        });
+        streamPublishTail = operation.catch(() => undefined);
+        return operation;
       };
 
       await invoke("execute_stream_command", {
@@ -451,6 +892,7 @@ export class DesktopSandboxBridge {
         timeoutMs: command.timeout ?? 30000,
         onEvent: channel,
       });
+      await streamPublishTail;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(
@@ -468,8 +910,75 @@ export class DesktopSandboxBridge {
         message,
       });
     } finally {
+      this.reportDesktopStreamCommandSettlement(
+        commandId,
+        recoveryState,
+        Date.now() - commandStartedAt,
+        telemetryContext,
+      );
       this.activeCommands.delete(commandId);
     }
+  }
+
+  private reportDesktopStreamCommandSettlement(
+    commandId: string,
+    recoveryState: DesktopStreamPublishRecoveryState,
+    durationMs: number,
+    telemetryContext: DesktopStreamTelemetryContext,
+  ): void {
+    if (!recoveryState.failureReported) return;
+
+    const outcome =
+      recoveryState.exhaustedChunks > 0
+        ? "incomplete"
+        : recoveryState.publishedChunks === recoveryState.observedChunks
+          ? "recovered"
+          : "interrupted";
+    const properties = {
+      connectionId: this.connectionId,
+      commandId,
+      ...(telemetryContext.chatId && { chatId: telemetryContext.chatId }),
+      ...(telemetryContext.triggerRunId && {
+        triggerRunId: telemetryContext.triggerRunId,
+      }),
+      outcome,
+      observedChunks: recoveryState.observedChunks,
+      publishedChunks: recoveryState.publishedChunks,
+      exhaustedChunks: recoveryState.exhaustedChunks,
+      terminalChunkObserved: recoveryState.terminalChunkObserved,
+      terminalChunkPublished: recoveryState.terminalChunkPublished,
+      sequenceComplete:
+        recoveryState.observedChunks === recoveryState.publishedChunks,
+      durationMs,
+    };
+    const log = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level: outcome === "recovered" ? "info" : "error",
+      event: "desktop_stream_command_settled",
+      service: "desktop_bridge",
+      environment: process.env.NODE_ENV ?? "unknown",
+      request_id: commandId,
+      connection_id: this.connectionId,
+      command_id: commandId,
+      chat_id: telemetryContext.chatId,
+      trigger_run_id: telemetryContext.triggerRunId,
+      outcome,
+      observed_chunks: recoveryState.observedChunks,
+      published_chunks: recoveryState.publishedChunks,
+      exhausted_chunks: recoveryState.exhaustedChunks,
+      terminal_chunk_observed: recoveryState.terminalChunkObserved,
+      terminal_chunk_published: recoveryState.terminalChunkPublished,
+      sequence_complete:
+        recoveryState.observedChunks === recoveryState.publishedChunks,
+      duration_ms: durationMs,
+    });
+
+    if (outcome === "recovered") {
+      console.info(log);
+    } else {
+      console.error(log);
+    }
+    captureAuthenticatedEvent("desktop_stream_command_settled", properties);
   }
 
   private getErrorMessage(error: unknown): string {
@@ -487,7 +996,18 @@ export class DesktopSandboxBridge {
     });
   }
 
-  private async callLocalFileServer<T>(
+  private isUnavailableNativeFileCommandError(error: unknown): boolean {
+    const message = this.getErrorMessage(error).toLowerCase();
+    return (
+      message.includes("desktop_file_request") &&
+      (message.includes("not found") ||
+        message.includes("unknown command") ||
+        message.includes("not registered") ||
+        message.includes("not allowed by acl"))
+    );
+  }
+
+  private async callLegacyLocalFileServer<T>(
     route: string,
     body: Record<string, unknown>,
   ): Promise<T> {
@@ -516,6 +1036,110 @@ export class DesktopSandboxBridge {
       );
     }
     return payload as T;
+  }
+
+  /** Check file transport availability without creating files or hanging terminal startup. */
+  private async probeFileBridge(): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // A read-only directory stat checks the transport without creating files
+      // or depending on a particular home directory or shell.
+      const payload = await Promise.race([
+        this.callDesktopFileBridge<{ kind: string; path: string }>(
+          "file_stat",
+          "/files/stat",
+          { path: "." },
+        ),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("Desktop file probe timed out")),
+            DESKTOP_FILE_PROBE_TIMEOUT_MS,
+          );
+        }),
+      ]);
+      if (
+        !payload ||
+        payload.kind !== "not_file" ||
+        typeof payload.path !== "string"
+      ) {
+        throw new Error("Invalid desktop file probe response");
+      }
+      return true;
+    } catch (error) {
+      // A filesystem permission error proves the handler responded. Keep native
+      // handling so an access denial cannot silently select a different adapter.
+      const message = this.getErrorMessage(error);
+      const permissionDenied =
+        /permission denied|access denied|operation not permitted|forbidden/i.test(
+          message,
+        );
+      captureAuthenticatedEvent("desktop_file_bridge_probe_failed", {
+        transport:
+          this.nativeFileIpcAvailable === false ? "legacy_http" : "native_ipc",
+        reason: permissionDenied ? "permission_denied" : "unavailable",
+      });
+      return permissionDenied;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async callDesktopFileBridge<T>(
+    requestType:
+      | "file_stat"
+      | "file_read"
+      | "file_write"
+      | "file_append"
+      | "file_remove"
+      | "file_list",
+    legacyRoute: string,
+    body: Record<string, unknown>,
+  ): Promise<T> {
+    if (this.nativeFileIpcAvailable !== false) {
+      const { invoke } = await import("@tauri-apps/api/core");
+      try {
+        const payload = await invoke<T>("desktop_file_request", {
+          request: { ...body, type: requestType },
+        });
+        this.nativeFileIpcAvailable = true;
+        return payload;
+      } catch (error) {
+        if (!this.isUnavailableNativeFileCommandError(error)) {
+          if (isFileTransportError(error)) {
+            throw this.fileTransportFailure(requestType, "native_ipc");
+          }
+          throw error;
+        }
+        this.nativeFileIpcAvailable = false;
+        console.warn(
+          "[desktop-bridge] Native file IPC is unavailable; using the legacy loopback bridge",
+        );
+      }
+    }
+
+    try {
+      return await this.callLegacyLocalFileServer<T>(legacyRoute, body);
+    } catch (error) {
+      if (isFileTransportError(error)) {
+        throw this.fileTransportFailure(requestType, "legacy_http");
+      }
+      throw error;
+    }
+  }
+
+  /** Report the failing adapter without logging paths, content, credentials, or raw errors. */
+  private fileTransportFailure(
+    operation: string,
+    transport: "native_ipc" | "legacy_http",
+  ): Error {
+    captureAuthenticatedEvent("desktop_file_bridge_transport_failed", {
+      connectionId: this.connectionId,
+      operation,
+      transport,
+    });
+    return new Error(
+      `Desktop file bridge transport failed (${transport}, ${operation}). Reconnect the Desktop app and retry after it is ready. A write may have completed; verify the file before retrying a mutation. This is not a file-permission diagnosis.`,
+    );
   }
 
   private countLines(content: string): number {
@@ -566,7 +1190,7 @@ export class DesktopSandboxBridge {
     }
 
     if (content === undefined) {
-      throw new Error("Desktop file server returned an invalid read payload");
+      throw new Error("Desktop file bridge returned an invalid read payload");
     }
 
     const lines = content.split("\n");
@@ -588,38 +1212,30 @@ export class DesktopSandboxBridge {
   private async handleFileStat(message: FileStatMessage): Promise<void> {
     const { requestId, path } = message;
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      const metadata = await invoke<{ path: string; size: number }>(
-        "get_local_file_metadata",
-        { path },
-      );
+      const payload = await this.callDesktopFileBridge<{
+        kind: "file" | "not_file" | "missing";
+        path: string;
+        sizeBytes?: number;
+      }>("file_stat", "/files/stat", { path });
+      if (
+        typeof payload.path !== "string" ||
+        (payload.kind !== "file" &&
+          payload.kind !== "not_file" &&
+          payload.kind !== "missing")
+      ) {
+        throw new Error("Desktop file bridge returned an invalid stat payload");
+      }
+      if (payload.kind === "file" && typeof payload.sizeBytes !== "number") {
+        throw new Error("Desktop file bridge returned an invalid stat payload");
+      }
       await this.publishResult({
         type: "file_stat_result",
         requestId,
-        kind: "file",
-        path: metadata.path,
-        sizeBytes: metadata.size,
+        kind: payload.kind,
+        path: payload.path,
+        ...(payload.kind === "file" ? { sizeBytes: payload.sizeBytes } : {}),
       });
     } catch (error) {
-      const msg = this.getErrorMessage(error);
-      if (msg.includes("Selected path is not a file")) {
-        await this.publishResult({
-          type: "file_stat_result",
-          requestId,
-          kind: "not_file",
-          path,
-        });
-        return;
-      }
-      if (msg.includes("Metadata error")) {
-        await this.publishResult({
-          type: "file_stat_result",
-          requestId,
-          kind: "missing",
-          path,
-        });
-        return;
-      }
       await this.publishFileError(requestId, error);
     }
   }
@@ -627,13 +1243,17 @@ export class DesktopSandboxBridge {
   private async handleFileRead(message: FileReadMessage): Promise<void> {
     const { requestId, path, range, maxFullBytes, maxResultBytes } = message;
     try {
-      const payload = await this.callLocalFileServer<unknown>("/files/read", {
-        path,
-        range_start: range?.[0],
-        range_end: range?.[1],
-        max_full_bytes: maxFullBytes,
-        max_result_bytes: maxResultBytes,
-      });
+      const payload = await this.callDesktopFileBridge<unknown>(
+        "file_read",
+        "/files/read",
+        {
+          path,
+          range_start: range?.[0],
+          range_end: range?.[1],
+          max_full_bytes: maxFullBytes,
+          max_result_bytes: maxResultBytes,
+        },
+      );
       await this.publishResult({
         type: "file_read_result",
         requestId,
@@ -645,12 +1265,13 @@ export class DesktopSandboxBridge {
   }
 
   private async handleFileWrite(message: FileWriteMessage): Promise<void> {
-    const { requestId, path, content, isBase64 } = message;
+    const { requestId, path, content, isBase64, allowedRoot } = message;
     try {
-      await this.callLocalFileServer("/files/write", {
+      await this.callDesktopFileBridge("file_write", "/files/write", {
         path,
         content,
         is_base64: Boolean(isBase64),
+        allowed_root: allowedRoot,
       });
       await this.publishResult({ type: "file_ok", requestId });
     } catch (error) {
@@ -659,12 +1280,13 @@ export class DesktopSandboxBridge {
   }
 
   private async handleFileAppend(message: FileAppendMessage): Promise<void> {
-    const { requestId, path, content, isBase64 } = message;
+    const { requestId, path, content, isBase64, allowedRoot } = message;
     try {
-      await this.callLocalFileServer("/files/append", {
+      await this.callDesktopFileBridge("file_append", "/files/append", {
         path,
         content,
         is_base64: Boolean(isBase64),
+        allowed_root: allowedRoot,
       });
       await this.publishResult({ type: "file_ok", requestId });
     } catch (error) {
@@ -675,7 +1297,9 @@ export class DesktopSandboxBridge {
   private async handleFileRemove(message: FileRemoveMessage): Promise<void> {
     const { requestId, path } = message;
     try {
-      await this.callLocalFileServer("/files/remove", { path });
+      await this.callDesktopFileBridge("file_remove", "/files/remove", {
+        path,
+      });
       await this.publishResult({ type: "file_ok", requestId });
     } catch (error) {
       await this.publishFileError(requestId, error);
@@ -685,7 +1309,8 @@ export class DesktopSandboxBridge {
   private async handleFileList(message: FileListMessage): Promise<void> {
     const { requestId, path } = message;
     try {
-      const entries = await this.callLocalFileServer<Array<{ name: string }>>(
+      const entries = await this.callDesktopFileBridge<Array<{ name: string }>>(
+        "file_list",
         "/files/list",
         { path },
       );
@@ -702,7 +1327,9 @@ export class DesktopSandboxBridge {
   private async handleCommandCancel(
     command: CommandCancelMessage,
   ): Promise<void> {
-    let canceled = false;
+    // Cancellation is idempotent: if the command already left the active set,
+    // there is no process left to terminate.
+    let canceled = !this.activeCommands.has(command.commandId);
     if (this.activeCommands.has(command.commandId)) {
       try {
         const { invoke } = await import("@tauri-apps/api/core");
@@ -732,7 +1359,9 @@ export class DesktopSandboxBridge {
   private async forwardChunk(
     commandId: string,
     chunk: StreamChunk,
+    sequence?: number,
   ): Promise<void> {
+    const sequenceField = sequence === undefined ? {} : { sequence };
     switch (chunk.type) {
       case "stdout":
         if (chunk.data) {
@@ -740,6 +1369,7 @@ export class DesktopSandboxBridge {
             type: "stdout",
             commandId,
             data: chunk.data,
+            ...sequenceField,
           });
         }
         break;
@@ -749,6 +1379,7 @@ export class DesktopSandboxBridge {
             type: "stderr",
             commandId,
             data: chunk.data,
+            ...sequenceField,
           });
         }
         break;
@@ -767,6 +1398,7 @@ export class DesktopSandboxBridge {
           type: "exit",
           commandId,
           exitCode: chunk.exitCode ?? -1,
+          ...sequenceField,
         });
         break;
       case "error":
@@ -783,22 +1415,232 @@ export class DesktopSandboxBridge {
           type: "error",
           commandId,
           message: chunk.message || "Unknown error",
+          ...sequenceField,
         });
         break;
     }
   }
 
+  private async forwardChunkWithRetry(
+    commandId: string,
+    chunk: StreamChunk,
+    sequence: number,
+    recoveryState: DesktopStreamPublishRecoveryState,
+    recoveryDeadlineAt: number,
+    telemetryContext: DesktopStreamTelemetryContext,
+  ): Promise<void> {
+    let firstFailureAt: number | null = null;
+    let firstFailureReason: DesktopStreamPublishFailureReason | null = null;
+
+    for (
+      let attempt = 1;
+      attempt <= DESKTOP_STREAM_PUBLISH_MAX_ATTEMPTS;
+      attempt++
+    ) {
+      if (this.isStoppingOrStopped) return;
+
+      try {
+        await this.forwardChunk(commandId, chunk, sequence);
+        recoveryState.publishedChunks += 1;
+        if (chunk.type === "exit" || chunk.type === "error") {
+          recoveryState.terminalChunkPublished = true;
+        }
+        if (
+          firstFailureAt !== null &&
+          firstFailureReason !== null &&
+          !recoveryState.recoveryReported
+        ) {
+          recoveryState.recoveryReported = true;
+          const recoveryLatencyMs = Date.now() - firstFailureAt;
+          console.info(
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              level: "info",
+              event: "desktop_stream_publish_recovered",
+              service: "desktop_bridge",
+              environment: process.env.NODE_ENV ?? "unknown",
+              request_id: commandId,
+              connection_id: this.connectionId,
+              command_id: commandId,
+              chat_id: telemetryContext.chatId,
+              trigger_run_id: telemetryContext.triggerRunId,
+              chunk_type: chunk.type,
+              reason: firstFailureReason,
+              attempts: attempt,
+              recovery_latency_ms: recoveryLatencyMs,
+            }),
+          );
+          captureAuthenticatedEvent("desktop_stream_publish_recovered", {
+            connectionId: this.connectionId,
+            commandId,
+            ...(telemetryContext.chatId && {
+              chatId: telemetryContext.chatId,
+            }),
+            ...(telemetryContext.triggerRunId && {
+              triggerRunId: telemetryContext.triggerRunId,
+            }),
+            chunkType: chunk.type,
+            reason: firstFailureReason,
+            attempts: attempt,
+            recoveryLatencyMs,
+          });
+        }
+        return;
+      } catch (error) {
+        const reason = classifyDesktopStreamPublishFailure(error);
+        if (!reason) throw error;
+
+        firstFailureAt ??= Date.now();
+        firstFailureReason ??= reason;
+
+        if (!recoveryState.failureReported) {
+          recoveryState.failureReported = true;
+          console.warn(
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              level: "warn",
+              event: "desktop_stream_publish_failed",
+              service: "desktop_bridge",
+              environment: process.env.NODE_ENV ?? "unknown",
+              request_id: commandId,
+              connection_id: this.connectionId,
+              command_id: commandId,
+              chat_id: telemetryContext.chatId,
+              trigger_run_id: telemetryContext.triggerRunId,
+              chunk_type: chunk.type,
+              reason,
+              attempt,
+              max_attempts: DESKTOP_STREAM_PUBLISH_MAX_ATTEMPTS,
+            }),
+          );
+          captureAuthenticatedEvent("desktop_stream_publish_failed", {
+            connectionId: this.connectionId,
+            commandId,
+            ...(telemetryContext.chatId && {
+              chatId: telemetryContext.chatId,
+            }),
+            ...(telemetryContext.triggerRunId && {
+              triggerRunId: telemetryContext.triggerRunId,
+            }),
+            chunkType: chunk.type,
+            reason,
+            attempt,
+            maxAttempts: DESKTOP_STREAM_PUBLISH_MAX_ATTEMPTS,
+          });
+        }
+
+        if (
+          attempt < DESKTOP_STREAM_PUBLISH_MAX_ATTEMPTS &&
+          Date.now() < recoveryDeadlineAt
+        ) {
+          await this.waitForRelayReady(attempt, recoveryDeadlineAt);
+          if (this.isStoppingOrStopped) return;
+          if (Date.now() < recoveryDeadlineAt) continue;
+        }
+
+        recoveryState.exhaustedChunks += 1;
+        if (!recoveryState.exhaustionReported) {
+          recoveryState.exhaustionReported = true;
+          const recoveryLatencyMs = Date.now() - firstFailureAt;
+          const exhaustionReason =
+            Date.now() >= recoveryDeadlineAt ? "deadline" : "attempts";
+          console.error(
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              level: "error",
+              event: "desktop_stream_publish_recovery_exhausted",
+              service: "desktop_bridge",
+              environment: process.env.NODE_ENV ?? "unknown",
+              request_id: commandId,
+              connection_id: this.connectionId,
+              command_id: commandId,
+              chat_id: telemetryContext.chatId,
+              trigger_run_id: telemetryContext.triggerRunId,
+              chunk_type: chunk.type,
+              reason: firstFailureReason,
+              attempts: attempt,
+              exhaustion_reason: exhaustionReason,
+              recovery_latency_ms: recoveryLatencyMs,
+            }),
+          );
+          captureAuthenticatedEvent(
+            "desktop_stream_publish_recovery_exhausted",
+            {
+              connectionId: this.connectionId,
+              commandId,
+              ...(telemetryContext.chatId && {
+                chatId: telemetryContext.chatId,
+              }),
+              ...(telemetryContext.triggerRunId && {
+                triggerRunId: telemetryContext.triggerRunId,
+              }),
+              chunkType: chunk.type,
+              reason: firstFailureReason,
+              attempts: attempt,
+              exhaustionReason,
+              recoveryLatencyMs,
+            },
+          );
+        }
+        throw error;
+      }
+    }
+  }
+
+  private async waitForRelayReady(
+    attempt: number,
+    recoveryDeadlineAt: number,
+  ): Promise<void> {
+    const remainingBeforeBackoffMs = Math.max(
+      0,
+      recoveryDeadlineAt - Date.now(),
+    );
+    const backoffMs = Math.min(
+      DESKTOP_STREAM_PUBLISH_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1),
+      remainingBeforeBackoffMs,
+    );
+    if (backoffMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+    }
+    if (this.isStoppingOrStopped) return;
+
+    const readyTimeoutMs = Math.min(
+      DESKTOP_STREAM_RECONNECT_WAIT_MS,
+      Math.max(0, recoveryDeadlineAt - Date.now()),
+    );
+    if (readyTimeoutMs <= 0) return;
+
+    const readyChecks = [
+      this.client?.ready(readyTimeoutMs),
+      this.subscription?.ready(readyTimeoutMs),
+    ].filter((promise): promise is Promise<void> => Boolean(promise));
+    await Promise.allSettled(readyChecks);
+  }
+
   private async publishResult(message: SandboxMessage): Promise<void> {
     if (this.isStoppingOrStopped) return;
-    if (!this.subscription) {
+    if (!this.publishQueue) {
       throw new Error(
         "[DesktopSandboxBridge] Cannot publish result: subscription is null",
       );
     }
     try {
-      await this.subscription.publish(message);
+      const queue = this.publishQueue;
+      const payload = message as unknown as Record<string, unknown>;
+      if (this.operationRouter) {
+        await this.operationRouter.publish(payload, (value) =>
+          queue.publish(value),
+        );
+      } else {
+        await queue.publish(payload);
+      }
     } catch (error) {
-      console.error("[DesktopSandboxBridge] Failed to publish result:", error);
+      if (!classifyDesktopStreamPublishFailure(error)) {
+        console.error(
+          "[DesktopSandboxBridge] Failed to publish result:",
+          error,
+        );
+      }
       throw error;
     }
   }
@@ -810,6 +1652,8 @@ export class DesktopSandboxBridge {
       const { invoke, Channel } = await import("@tauri-apps/api/core");
 
       const channel = new Channel<string>();
+      let ready = false;
+      const pendingChunks: string[] = [];
       // Serialize publishes: Rust now flushes per-read (could be per-char on
       // interactive echo). Firing 12 unawaited publishes at the Centrifuge
       // client caused reordered arrival at the server, producing garbled
@@ -845,7 +1689,7 @@ export class DesktopSandboxBridge {
         ptyDebounceTimer = null;
       };
 
-      channel.onmessage = (chunk: string) => {
+      const forwardPtyChunk = (chunk: string) => {
         // The Tauri PTY backend sends raw output strings and a final JSON
         // exit sentinel: {"type":"exit","exitCode":N,"sessionId":"..."}.
         // We require ALL three sentinel fields before treating a chunk as an
@@ -885,6 +1729,11 @@ export class DesktopSandboxBridge {
         }
       };
 
+      channel.onmessage = (chunk: string) => {
+        if (!ready) pendingChunks.push(chunk);
+        else forwardPtyChunk(chunk);
+      };
+
       const result = (await invoke("execute_pty_create", {
         sessionId,
         command,
@@ -904,15 +1753,16 @@ export class DesktopSandboxBridge {
         );
       }
 
-      // Route pty_ready through the same publishQueue that pty_data/pty_exit
-      // use. Direct publishResult can arrive AFTER already-queued pty_data
-      // chunks on fast-starting commands — the server-side adapter would then
-      // see pty_data with no matching pty_ready and drop the output.
+      // Native output can arrive before invoke resolves. Announce readiness
+      // first: an early exit otherwise closes the route before pty_ready.
       enqueuePublish({
         type: "pty_ready",
         sessionId,
         pid: result.pid,
       });
+      ready = true;
+      for (const chunk of pendingChunks) forwardPtyChunk(chunk);
+      pendingChunks.length = 0;
     } catch (err) {
       // The failure path never reaches the channel.onmessage listener, so
       // no pty_data was queued for this session — publishResult direct is
@@ -984,16 +1834,15 @@ export class DesktopSandboxBridge {
   }
 
   async stop(): Promise<void> {
+    this.startupGeneration += 1;
     this.isStoppingOrStopped = true;
-    if (this.connectionId) {
-      try {
-        await this.config.disconnectDesktop({
-          connectionId: this.connectionId,
-        });
-      } catch (error) {
-        console.warn("[DesktopSandboxBridge] Failed to disconnect:", error);
-      }
-    }
+    this.stopHeartbeat();
+    this.relayTelemetry.flush();
+    this.publishQueue = null;
+    this.operationRouter?.stop();
+    this.operationRouter = null;
+    const connectionId = this.connectionId;
+    this.connectionId = null;
 
     if (this.subscription) {
       try {
@@ -1017,6 +1866,12 @@ export class DesktopSandboxBridge {
       this.client = null;
     }
 
-    this.connectionId = null;
+    // Convex queues mutations while offline. Local cleanup and recovery must
+    // never wait for that network request to settle.
+    if (connectionId) {
+      void this.config.disconnectDesktop({ connectionId }).catch((error) => {
+        console.warn("[DesktopSandboxBridge] Failed to disconnect:", error);
+      });
+    }
   }
 }

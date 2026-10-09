@@ -1,12 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
-import { Centrifuge, type Subscription } from "centrifuge";
+import {
+  Centrifuge,
+  type Subscription,
+  type SubscriptionErrorContext,
+} from "centrifuge";
+import { trackPresenceTraffic } from "@/lib/centrifugo/presence-traffic";
 import { getUserID } from "@/lib/auth/get-user-id";
 import { generateCentrifugoToken } from "@/lib/centrifugo/jwt";
 import { ConvexHttpClient } from "convex/browser";
 import { api } from "@/convex/_generated/api";
 import { phLogger } from "@/lib/posthog/server";
 import { sandboxConnectionChannel } from "@/lib/centrifugo/types";
-import { presenceHasConnectionId } from "@/lib/centrifugo/presence";
+import {
+  LOCAL_SANDBOX_PRESENCE_GRACE_MS,
+  presenceHasConnectionId,
+} from "@/lib/centrifugo/presence";
 
 export async function GET(request: NextRequest) {
   let userId: string;
@@ -48,10 +56,12 @@ export async function GET(request: NextRequest) {
 
   let client: Centrifuge | null = null;
   const subscriptions: Subscription[] = [];
+  const finishTraffic: Array<() => void> = [];
+  const cleanups: Array<() => void> = [];
   const probeStart = Date.now();
   try {
     const token = await generateCentrifugoToken(userId, 30);
-    client = new Centrifuge(wsUrl, { token });
+    client = new Centrifuge(wsUrl, { token, name: "hackerai-presence-route" });
 
     const probes = connections.map(
       (connection) =>
@@ -60,6 +70,7 @@ export async function GET(request: NextRequest) {
             sandboxConnectionChannel(userId, connection.connectionId),
           );
           subscriptions.push(sub);
+          finishTraffic.push(trackPresenceTraffic(sub, "presence-route"));
 
           const timeout = setTimeout(() => {
             cleanup();
@@ -72,10 +83,12 @@ export async function GET(request: NextRequest) {
 
           const cleanup = () => {
             clearTimeout(timeout);
-            sub.removeAllListeners();
+            sub.removeListener("subscribed", onSubscribed);
+            sub.removeListener("error", onError);
           };
+          cleanups.push(cleanup);
 
-          sub.on("subscribed", async () => {
+          const onSubscribed = async () => {
             try {
               const result = await sub.presence();
               if (presenceHasConnectionId(result, connection.connectionId)) {
@@ -87,15 +100,17 @@ export async function GET(request: NextRequest) {
               cleanup();
               reject(e);
             }
-          });
+          };
 
-          sub.on("error", (ctx) => {
+          const onError = (ctx: SubscriptionErrorContext) => {
             cleanup();
             reject(
               new Error(ctx.error?.message ?? "Centrifugo subscription error"),
             );
-          });
+          };
 
+          sub.on("subscribed", onSubscribed);
+          sub.on("error", onError);
           sub.subscribe();
         }),
     );
@@ -113,6 +128,8 @@ export async function GET(request: NextRequest) {
       error: err,
     });
   } finally {
+    cleanups.forEach((cleanup) => cleanup());
+    finishTraffic.forEach((finish) => finish());
     for (const sub of subscriptions) {
       sub.removeAllListeners();
       sub.unsubscribe();
@@ -132,14 +149,13 @@ export async function GET(request: NextRequest) {
   // Skip rows whose lastSeen is within the grace window — covers the race where a
   // client has just inserted its row but hasn't finished subscribing to Centrifugo,
   // and brief WebSocket reconnects on healthy clients (last_heartbeat is bumped on
-  // every successful Centrifugo token refresh).
-  const PRESENCE_GRACE_MS = 30_000;
+  // a lightweight client heartbeat).
   if (presenceReliable) {
     const now = Date.now();
     const stale = connections.filter(
       (conn) =>
         !onlineConnectionIds.has(conn.connectionId) &&
-        now - conn.lastSeen > PRESENCE_GRACE_MS,
+        now - conn.lastSeen > LOCAL_SANDBOX_PRESENCE_GRACE_MS,
     );
     if (stale.length > 0) {
       const results = await Promise.allSettled(

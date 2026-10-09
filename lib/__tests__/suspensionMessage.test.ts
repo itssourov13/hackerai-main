@@ -22,6 +22,26 @@ describe("getSuspensionMessage", () => {
     expect(msg).toContain(SUPPORT_URL);
   });
 
+  it("uses the support-confirmed fraud label without leaking the case id", () => {
+    const msg = getSuspensionMessage(
+      "support_confirmed_fraud:support_case:intercom_456",
+    );
+    expect(msg).toContain("confirmed fraudulent payment activity");
+    expect(msg).toContain(SUPPORT_URL);
+    expect(msg).not.toContain("intercom_456");
+    expect(msg).not.toContain("support_confirmed_fraud");
+  });
+
+  it("explains a security ban without exposing internal case details", () => {
+    const msg = getSuspensionMessage("security_abuse:abuse_case_123");
+    expect(msg).toContain(
+      "security misuse that violates our acceptable use policy",
+    );
+    expect(msg).toContain(SUPPORT_URL);
+    expect(msg).not.toContain("abuse_case_123");
+    expect(msg).not.toContain("payment");
+  });
+
   it("falls back to the generic label when the reason is missing", () => {
     expect(getSuspensionMessage(undefined)).toContain("suspicious activity");
     expect(getSuspensionMessage(null)).toContain("suspicious activity");

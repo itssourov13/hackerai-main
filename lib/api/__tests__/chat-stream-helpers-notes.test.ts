@@ -7,8 +7,10 @@
  */
 
 import {
+  injectNotesIntoMessages,
   replaceNotesBlock,
   refreshNotesInModelMessages,
+  getAppendedNotesUpdate,
 } from "@/lib/api/chat-stream-helpers";
 
 // ── Mock external dependencies used by refreshNotesInModelMessages ──────────
@@ -40,6 +42,43 @@ function buildNotesReminder(noteTitle: string): string {
 
 const RESUME_REMINDER =
   "<system-reminder>\n<resume_context>Your previous response was interrupted.</resume_context>\n</system-reminder>";
+
+describe("appended notes snapshots", () => {
+  const opts = {
+    userId: "user",
+    subscription: "pro" as const,
+    shouldIncludeNotes: true,
+  };
+  beforeEach(() => mockGetNotes.mockReset());
+  it("explicitly clears deleted notes without rewriting old context", async () => {
+    mockGetNotes.mockResolvedValue([]);
+    expect(
+      await getAppendedNotesUpdate([{ toolName: "delete_note" }], opts),
+    ).toContain("No saved notes remain.");
+  });
+  it("does not turn a failed lookup into a deletion or fetch after unrelated tools", async () => {
+    expect(
+      await getAppendedNotesUpdate([{ toolName: "file" }], opts),
+    ).toBeUndefined();
+    expect(mockGetNotes).not.toHaveBeenCalled();
+    mockGetNotes.mockRejectedValue(new Error("unavailable"));
+    expect(await getAppendedNotesUpdate([], opts, true)).toBeUndefined();
+    expect(mockGetNotes).toHaveBeenLastCalledWith({
+      ...opts,
+      throwOnError: true,
+    });
+  });
+  it("honors the current notes opt-out even during resume", async () => {
+    expect(
+      await getAppendedNotesUpdate(
+        [],
+        { ...opts, shouldIncludeNotes: false },
+        true,
+      ),
+    ).toBeUndefined();
+    expect(mockGetNotes).not.toHaveBeenCalled();
+  });
+});
 
 // ── replaceNotesBlock ───────────────────────────────────────────────────────
 
@@ -116,7 +155,6 @@ describe("refreshNotesInModelMessages", () => {
     userId: "user_1",
     subscription: "pro" as const,
     shouldIncludeNotes: true,
-    isTemporary: false,
   };
 
   const oldNotesBlock = buildNotesReminder("Old Note");
@@ -236,17 +274,6 @@ describe("refreshNotesInModelMessages", () => {
     expect(mockGetNotes).not.toHaveBeenCalled();
   });
 
-  it("returns messages unchanged when isTemporary is true", async () => {
-    const messages = buildConversationMessages(`text\n\n${oldNotesBlock}`);
-    const result = await refreshNotesInModelMessages(messages, {
-      ...baseOpts,
-      isTemporary: true,
-    });
-
-    expect(result).toBe(messages);
-    expect(mockGetNotes).not.toHaveBeenCalled();
-  });
-
   it("appends notes when no existing notes block exists (AI SDK strips system-reminder)", async () => {
     const messages = [
       { role: "user", content: [{ type: "text", text: "just a message" }] },
@@ -357,5 +384,54 @@ describe("refreshNotesInModelMessages", () => {
     expect(text).toContain("<resume_context>");
     expect(text).toContain("New Note");
     expect(text).not.toContain("Old Note");
+  });
+});
+
+// ── injectNotesIntoMessages preload ─────────────────────────────────────────
+
+describe("injectNotesIntoMessages", () => {
+  beforeEach(() => {
+    mockGetNotes.mockReset();
+  });
+
+  const userMessage = {
+    id: "u1",
+    role: "user" as const,
+    parts: [{ type: "text" as const, text: "hello" }],
+  };
+  const note = {
+    note_id: "note_1",
+    title: "Preloaded",
+    content: "some content",
+    tags: ["general"],
+    updated_at: Date.parse("2024-01-15T00:00:00Z"),
+  };
+
+  it("uses preloaded notes instead of fetching again", async () => {
+    const result = await injectNotesIntoMessages([userMessage], {
+      userId: "user-1",
+      subscription: "pro",
+      shouldIncludeNotes: true,
+      preloadedNotes: Promise.resolve([note] as never),
+    });
+
+    expect(mockGetNotes).not.toHaveBeenCalled();
+    const text = (result[0].parts[0] as { text: string }).text;
+    expect(text).toContain("<notes>");
+    expect(text).toContain("Preloaded");
+  });
+
+  it("falls back to fetching when no preload is provided", async () => {
+    mockGetNotes.mockResolvedValue([note]);
+
+    const result = await injectNotesIntoMessages([userMessage], {
+      userId: "user-1",
+      subscription: "pro",
+      shouldIncludeNotes: true,
+    });
+
+    expect(mockGetNotes).toHaveBeenCalledTimes(1);
+    const text = (result[0].parts[0] as { text: string }).text;
+    expect(text).toContain("Preloaded");
   });
 });

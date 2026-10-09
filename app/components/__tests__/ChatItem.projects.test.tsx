@@ -8,15 +8,30 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, jest } from "@jest/globals";
+import {
+  DndContext,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import type { ReactNode } from "react";
+import {
+  clearSidebarTaskLastVisitedAt,
+  markSidebarTaskVisited,
+  readSidebarTaskLastVisitedAt,
+} from "@/lib/utils/client-storage";
 
 const mockMoveChatToProject = jest.fn<any>();
+const mockRenameChat = jest.fn<any>();
+const mockRouterPush = jest.fn();
 const mockToastSuccess = jest.fn();
 const mockToastInfo = jest.fn();
 let mockProjects: any[] | undefined;
+let mockPathname = "/";
 
 jest.mock("next/navigation", () => ({
-  useRouter: () => ({ push: jest.fn() }),
-  usePathname: () => "/",
+  useRouter: () => ({ push: mockRouterPush }),
+  usePathname: () => mockPathname,
 }));
 jest.mock("@/app/contexts/GlobalState", () => ({
   useGlobalState: () => ({
@@ -33,7 +48,8 @@ jest.mock("@/hooks/use-mobile", () => ({
   useIsMobile: () => mockUseIsMobile(),
 }));
 jest.mock("convex/react", () => ({
-  useMutation: () => jest.fn(),
+  useConvex: () => ({ query: jest.fn().mockResolvedValue("complete") }),
+  useMutation: () => mockRenameChat,
 }));
 jest.mock("@/app/hooks/useChats", () => ({
   usePinChat: () => jest.fn(),
@@ -47,6 +63,8 @@ jest.mock("@/app/contexts/SidebarProjectList", () => ({
 }));
 jest.mock("sonner", () => ({
   toast: {
+    loading: jest.fn(),
+    dismiss: jest.fn(),
     success: mockToastSuccess,
     info: mockToastInfo,
     error: jest.fn(),
@@ -88,12 +106,20 @@ jest.mock("../MoveChatToProjectDialog", () => ({
 const ChatItem = require("../ChatItem")
   .default as typeof import("../ChatItem").default;
 
+function KeyboardDragHarness({ children }: { children: ReactNode }) {
+  const sensors = useSensors(useSensor(KeyboardSensor));
+  return <DndContext sensors={sensors}>{children}</DndContext>;
+}
+
 describe("ChatItem project actions", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockUseIsMobile.mockReturnValue(false);
     mockMoveChatToProject.mockResolvedValue(true);
+    mockRenameChat.mockResolvedValue(null);
     mockProjects = undefined;
+    mockPathname = "/";
+    clearSidebarTaskLastVisitedAt();
   });
 
   it("reveals an accessible move action when the row receives keyboard focus", async () => {
@@ -148,6 +174,7 @@ describe("ChatItem project actions", () => {
     });
     const taskOptionsMenu = moveTrigger.closest('[role="menu"]');
     expect(taskOptionsMenu).toHaveClass(
+      "z-[60]",
       "min-w-52",
       "rounded-xl",
       "border-border/80",
@@ -175,6 +202,7 @@ describe("ChatItem project actions", () => {
     const destinationItem = await screen.findByRole("menuitem", {
       name: "Acme target",
     });
+    expect(destinationItem.closest('[role="menu"]')).toHaveClass("z-[60]");
     expect(destinationItem).toHaveClass(
       "h-9",
       "gap-2.5",
@@ -298,6 +326,23 @@ describe("ChatItem project actions", () => {
     expect(input).toHaveAttribute("placeholder", "Task name…");
   });
 
+  it("does not persist the display-only default title when rename is unchanged", async () => {
+    const user = userEvent.setup();
+    render(<ChatItem id="chat-1" title="New Chat" />);
+
+    fireEvent.focus(screen.getByRole("button", { name: /Open task:/ }));
+    await user.click(screen.getByRole("button", { name: "Open task options" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Rename" }));
+
+    expect(await screen.findByLabelText("Task name")).toHaveValue("New Task");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(mockRenameChat).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("dialog", { name: "Rename Task" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("uses compact side padding for standard and project chat rows", () => {
     render(
       <>
@@ -320,6 +365,95 @@ describe("ChatItem project actions", () => {
     expect(screen.getByTestId("chat-item-chat-2")).not.toHaveClass("p-2");
   });
 
+  it("keeps the entire task row clickable and removes the dedicated drag handle", () => {
+    render(<ChatItem id="chat-1" title="Target notes" />);
+
+    const row = screen.getByRole("button", { name: /Open task:/ });
+    expect(row).not.toHaveAttribute("draggable");
+    expect(row).toHaveClass("cursor-pointer");
+    expect(row).toHaveAttribute("aria-roledescription", "draggable task");
+    expect(
+      screen.queryByTestId("chat-drag-handle-chat-1"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(row);
+
+    expect(mockRouterPush).toHaveBeenCalledWith("/c/chat-1");
+  });
+
+  it("does not start row navigation from the task options control", () => {
+    render(<ChatItem id="chat-1" title="Target notes" />);
+
+    const row = screen.getByRole("button", { name: /Open task:/ });
+    fireEvent.mouseEnter(row);
+    const options = screen.getByRole("button", {
+      name: "Open task options",
+    });
+
+    fireEvent.mouseDown(options, { button: 0, clientX: 0, clientY: 0 });
+    fireEvent.mouseMove(options, { clientX: 20, clientY: 0 });
+    fireEvent.mouseUp(options, { button: 0, clientX: 20, clientY: 0 });
+    fireEvent.click(options);
+
+    expect(mockRouterPush).not.toHaveBeenCalled();
+  });
+
+  it("uses Enter to open while reserving Space for keyboard dragging", () => {
+    render(<ChatItem id="chat-1" title="Target notes" />);
+
+    const row = screen.getByRole("button", { name: /Open task:/ });
+    fireEvent.keyDown(row, { key: " " });
+    expect(mockRouterPush).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(row, { key: "Enter" });
+    expect(mockRouterPush).toHaveBeenCalledWith("/c/chat-1");
+  });
+
+  it("does not open the task when Enter completes a keyboard drag", async () => {
+    render(
+      <KeyboardDragHarness>
+        <ChatItem id="chat-1" title="Target notes" />
+      </KeyboardDragHarness>,
+    );
+
+    const row = screen.getByRole("button", { name: /Open task:/ });
+    fireEvent.keyDown(row, { code: "Space", key: " " });
+    await waitFor(() => expect(row).toHaveClass("opacity-50"));
+
+    fireEvent.keyDown(row, { code: "Enter", key: "Enter" });
+    await waitFor(() => expect(row).not.toHaveClass("opacity-50"));
+    expect(mockRouterPush).not.toHaveBeenCalled();
+  });
+
+  it("does not expose desktop drag semantics on mobile", () => {
+    mockUseIsMobile.mockReturnValue(true);
+    render(<ChatItem id="chat-1" title="Target notes" />);
+
+    const row = screen.getByRole("button", { name: /Open task:/ });
+    expect(row).not.toHaveAttribute("aria-roledescription");
+    expect(row).not.toHaveAttribute("draggable");
+  });
+
+  it("keeps compact action padding after removing the drag icon", () => {
+    render(<ChatItem id="chat-1" title="Target notes" />);
+
+    const row = screen.getByRole("button", { name: /Open task:/ });
+    fireEvent.mouseEnter(row);
+    expect(
+      screen.getByText("Target notes").parentElement?.parentElement,
+    ).toHaveClass("pr-9");
+    expect(
+      screen.getByText("Target notes").parentElement?.parentElement,
+    ).not.toHaveClass("pr-[4.5rem]", "pr-[6.5rem]");
+    expect(
+      screen.queryByTestId("chat-drag-handle-chat-1"),
+    ).not.toBeInTheDocument();
+    expect(row).not.toHaveAttribute("draggable");
+    expect(
+      screen.getByRole("button", { name: "Open task options" }),
+    ).toBeVisible();
+  });
+
   it("centers the streaming indicator in the task action slot", () => {
     render(<ChatItem id="chat-1" title="Running task" isStreaming />);
 
@@ -333,6 +467,77 @@ describe("ChatItem project actions", () => {
     expect(
       screen.getByText("Running task").parentElement?.parentElement,
     ).toHaveClass("pr-9");
+  });
+
+  it("shows a completion dot when the server finish time is newer than the local visit", async () => {
+    markSidebarTaskVisited("chat-1", 1_000);
+    const view = render(
+      <ChatItem
+        id="chat-1"
+        title="Background task"
+        isStreaming
+        lastRunFinishedAt={1_000}
+      />,
+    );
+
+    expect(screen.getByTestId("chat-item-streaming-icon")).toBeInTheDocument();
+
+    view.rerender(
+      <ChatItem
+        id="chat-1"
+        title="Background task"
+        lastRunFinishedAt={2_000}
+      />,
+    );
+
+    const completionIndicator = await screen.findByTestId(
+      "chat-item-unread-completion-indicator",
+    );
+    expect(completionIndicator).toHaveAttribute("aria-label", "Task finished");
+    expect(screen.queryByTestId("chat-item-streaming-icon")).toBeNull();
+    expect(screen.getByRole("button", { name: /with unread result/ })).toBe(
+      screen.getByTestId("chat-item-chat-1"),
+    );
+    expect(
+      screen.getByText("Background task").parentElement?.parentElement,
+    ).toHaveClass("pr-9");
+
+    fireEvent.click(screen.getByTestId("chat-item-chat-1"));
+
+    await waitFor(() => {
+      expect(
+        screen.queryByTestId("chat-item-unread-completion-indicator"),
+      ).not.toBeInTheDocument();
+    });
+    expect(readSidebarTaskLastVisitedAt("chat-1")).toBeGreaterThanOrEqual(
+      2_000,
+    );
+  });
+
+  it("does not show a completion dot while the user is viewing the task", () => {
+    markSidebarTaskVisited("chat-1", 1_000);
+    mockPathname = "/c/chat-1";
+    render(
+      <ChatItem id="chat-1" title="Visible task" lastRunFinishedAt={2_000} />,
+    );
+
+    expect(
+      screen.queryByTestId("chat-item-unread-completion-indicator"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("treats a task with no local visit as already read", () => {
+    render(
+      <ChatItem
+        id="chat-1"
+        title="Historical task"
+        lastRunFinishedAt={2_000}
+      />,
+    );
+
+    expect(
+      screen.queryByTestId("chat-item-unread-completion-indicator"),
+    ).not.toBeInTheDocument();
   });
 
   it("reserves space for streaming and task actions on mobile", () => {

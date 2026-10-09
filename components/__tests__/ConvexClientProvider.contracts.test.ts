@@ -12,7 +12,7 @@ const rootLayoutSource = fs.readFileSync(
 const authkitPatchSource = fs.readFileSync(
   path.resolve(
     __dirname,
-    "../../patches/@workos-inc__authkit-nextjs@4.2.0.patch",
+    "../../patches/@workos-inc__authkit-nextjs@4.3.2.patch",
   ),
   "utf8",
 );
@@ -72,5 +72,18 @@ describe("ConvexClientProvider auth recovery contracts", () => {
       "if (isEndedSessionRefreshError(error))",
     );
     expect(authkitPatchSource).toContain("return { accessToken: undefined };");
+  });
+
+  it("normalizes nullish refresh action options before destructuring", () => {
+    expect(authkitPatchSource).toContain(
+      "export const refreshAuthAction = async (options)",
+    );
+    expect(authkitPatchSource).toContain(
+      "export const refreshAuthAction = async (options?: RefreshAuthActionOptions | null)",
+    );
+    expect(authkitPatchSource).toContain(
+      "const { ensureSignedIn, organizationId } = options ?? {};",
+    );
+    expect(authkitPatchSource).toContain("it.each([undefined, null])");
   });
 });

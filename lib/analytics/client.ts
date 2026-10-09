@@ -9,6 +9,7 @@ import {
   paidFunnelProperties,
   upgradeCtaImpressionInsertId,
 } from "@/lib/analytics/paid-funnel";
+import { POSTHOG_SESSION_ID_HEADER } from "@/lib/analytics/request-context";
 
 type ClientAnalyticsProperties = Record<string, unknown>;
 
@@ -17,8 +18,38 @@ type PostHogClient = typeof posthogJs & {
 };
 type PostHogCaptureOptions = Parameters<PostHogClient["capture"]>[2];
 
+type PendingAuthenticatedEvent = {
+  userId: string;
+  event: string;
+  properties: ClientAnalyticsProperties;
+  options?: PostHogCaptureOptions;
+};
+
 let posthogClient: PostHogClient | null = null;
 let posthogImportPromise: Promise<PostHogClient> | null = null;
+let authenticatedAnalyticsUserId: string | null = null;
+let identifiedAnalyticsUserId: string | null = null;
+const authenticatedAnalyticsListeners = new Set<() => void>();
+
+export function subscribeAuthenticatedAnalytics(listener: () => void) {
+  authenticatedAnalyticsListeners.add(listener);
+  return () => {
+    authenticatedAnalyticsListeners.delete(listener);
+  };
+}
+
+/** Null until consent permits capture and the provider has identified this user. */
+export function getIdentifiedAnalyticsUserId() {
+  return identifiedAnalyticsUserId === authenticatedAnalyticsUserId
+    ? identifiedAnalyticsUserId
+    : null;
+}
+
+function notifyAuthenticatedAnalyticsListeners() {
+  authenticatedAnalyticsListeners.forEach((listener) => listener());
+}
+const pendingAuthenticatedEvents: PendingAuthenticatedEvent[] = [];
+const MAX_PENDING_AUTHENTICATED_EVENTS = 100;
 const UPGRADE_IMPRESSION_STORAGE_KEY =
   "hackerai:analytics:upgrade-impressions:v1";
 
@@ -51,6 +82,86 @@ function getReadyPostHogClient() {
   return posthogClient?.__loaded ? posthogClient : null;
 }
 
+function captureWithPostHogClient(
+  posthog: PostHogClient,
+  event: string,
+  properties: ClientAnalyticsProperties,
+  options?: PostHogCaptureOptions,
+) {
+  try {
+    if (options) {
+      posthog.capture(event, properties, options);
+    } else {
+      posthog.capture(event, properties);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function queueAuthenticatedEvent(event: PendingAuthenticatedEvent) {
+  const uuid = event.options?.uuid;
+  if (
+    uuid &&
+    pendingAuthenticatedEvents.some(
+      (pendingEvent) =>
+        pendingEvent.userId === event.userId &&
+        pendingEvent.options?.uuid === uuid,
+    )
+  ) {
+    return;
+  }
+
+  pendingAuthenticatedEvents.push(event);
+  if (pendingAuthenticatedEvents.length > MAX_PENDING_AUTHENTICATED_EVENTS) {
+    pendingAuthenticatedEvents.shift();
+  }
+}
+
+export function setAuthenticatedAnalyticsUserId(userId: string | null) {
+  if (authenticatedAnalyticsUserId === userId) return;
+  authenticatedAnalyticsUserId = userId;
+  identifiedAnalyticsUserId = null;
+  pendingAuthenticatedEvents.splice(0);
+  notifyAuthenticatedAnalyticsListeners();
+}
+
+export function flushPendingAuthenticatedEvents(userId: string) {
+  if (
+    authenticatedAnalyticsUserId !== userId ||
+    identifiedAnalyticsUserId !== userId
+  ) {
+    return false;
+  }
+
+  const posthog = getReadyPostHogClient();
+  if (!posthog || pendingAuthenticatedEvents.length === 0) return false;
+
+  const pendingEvents = pendingAuthenticatedEvents.splice(0);
+  for (const pendingEvent of pendingEvents) {
+    if (pendingEvent.userId !== userId) continue;
+    if (
+      !captureWithPostHogClient(
+        posthog,
+        pendingEvent.event,
+        pendingEvent.properties,
+        pendingEvent.options,
+      )
+    ) {
+      queueAuthenticatedEvent(pendingEvent);
+    }
+  }
+  return pendingAuthenticatedEvents.length === 0;
+}
+
+export function confirmAuthenticatedAnalyticsUserId(userId: string) {
+  if (authenticatedAnalyticsUserId !== userId) return false;
+  identifiedAnalyticsUserId = userId;
+  notifyAuthenticatedAnalyticsListeners();
+  return flushPendingAuthenticatedEvents(userId);
+}
+
 export function captureAuthenticatedEvent(
   event: string,
   properties: ClientAnalyticsProperties = {},
@@ -64,16 +175,66 @@ export function captureAuthenticatedEvent(
     return false;
   }
 
-  try {
-    if (options) {
-      posthog.capture(event, properties, options);
-    } else {
-      posthog.capture(event, properties);
-    }
+  return captureWithPostHogClient(posthog, event, properties, options);
+}
+
+export function captureQueuedAuthenticatedEvent({
+  event,
+  properties = {},
+  dedupeKey,
+}: {
+  event: string;
+  properties?: ClientAnalyticsProperties;
+  dedupeKey: string;
+}) {
+  const userId = authenticatedAnalyticsUserId;
+  if (!userId) return false;
+
+  const options = {
+    uuid: uuidv5([userId, event, dedupeKey].join(":"), uuidv5.URL),
+  };
+
+  if (
+    identifiedAnalyticsUserId === userId &&
+    captureAuthenticatedEvent(event, properties, options)
+  ) {
     return true;
-  } catch {
-    return false;
   }
+  if (!process.env.NEXT_PUBLIC_POSTHOG_KEY) return false;
+
+  queueAuthenticatedEvent({ userId, event, properties, options });
+  void loadPostHogClient()
+    .then(() => flushPendingAuthenticatedEvents(userId))
+    .catch(() => {});
+  return true;
+}
+
+export function captureMessageFeedback({
+  messageId,
+  feedbackType,
+  previousFeedbackType,
+}: {
+  messageId: string;
+  feedbackType: "positive" | "negative";
+  previousFeedbackType?: "positive" | "negative";
+}) {
+  const event = "message_feedback_submitted";
+  const properties = {
+    message_id: messageId,
+    feedback_type: feedbackType,
+    is_initial_feedback: previousFeedbackType === undefined,
+    ...(previousFeedbackType && {
+      previous_feedback_type: previousFeedbackType,
+    }),
+    feedback_event_version: 1,
+  };
+  return captureQueuedAuthenticatedEvent({
+    event,
+    properties,
+    dedupeKey: [messageId, previousFeedbackType ?? "none", feedbackType].join(
+      ":",
+    ),
+  });
 }
 
 export function addAuthenticatedExceptionStep(
@@ -104,14 +265,44 @@ type CtaAnalyticsProperties = ClientAnalyticsProperties & {
 export function captureUpgradeCtaImpression(
   properties: CtaAnalyticsProperties,
 ) {
+  return (
+    captureDailyCtaImpression(
+      PAID_FUNNEL_EVENTS.upgradeCtaImpressed,
+      properties,
+    ) === "captured"
+  );
+}
+
+export function captureComputerActivationImpression(
+  properties: CtaAnalyticsProperties,
+) {
+  // Already recorded today is also handled; only unavailable capture needs retry.
+  return (
+    captureDailyCtaImpression(
+      "computer_activation_cta_impressed",
+      properties,
+    ) !== "unavailable"
+  );
+}
+
+function captureDailyCtaImpression(
+  event:
+    | typeof PAID_FUNNEL_EVENTS.upgradeCtaImpressed
+    | "computer_activation_cta_impressed",
+  properties: CtaAnalyticsProperties,
+): "captured" | "duplicate" | "unavailable" {
   const posthog = getReadyPostHogClient();
   if (!posthog) {
     void loadPostHogClient().catch(() => {});
-    return false;
+    return "unavailable";
   }
 
   const day = new Date().toISOString().slice(0, 10);
   const distinctId = posthog.get_distinct_id();
+  const storageKey =
+    event === PAID_FUNNEL_EVENTS.upgradeCtaImpressed
+      ? UPGRADE_IMPRESSION_STORAGE_KEY
+      : "hackerai:analytics:computer-activation-impressions:v1";
   const dedupeKey = [
     distinctId,
     properties.surface,
@@ -120,7 +311,7 @@ export function captureUpgradeCtaImpression(
 
   let state: UpgradeImpressionState = { day, keys: [] };
   try {
-    const stored = window.localStorage.getItem(UPGRADE_IMPRESSION_STORAGE_KEY);
+    const stored = window.localStorage.getItem(storageKey);
     const parsed = stored
       ? (JSON.parse(stored) as UpgradeImpressionState)
       : null;
@@ -131,14 +322,14 @@ export function captureUpgradeCtaImpression(
     ) {
       state = parsed;
     }
-    if (state.keys.includes(dedupeKey)) return false;
+    if (state.keys.includes(dedupeKey)) return "duplicate";
   } catch {
     // Storage can be unavailable in privacy-restricted browsers. Capture the
     // event normally rather than dropping a legitimate impression.
   }
 
   const captured = captureAuthenticatedEvent(
-    PAID_FUNNEL_EVENTS.upgradeCtaImpressed,
+    event,
     paidFunnelProperties({
       ...properties,
       impression_dedupe_scope: UPGRADE_CTA_IMPRESSION_DEDUPE.scope,
@@ -147,27 +338,36 @@ export function captureUpgradeCtaImpression(
     }),
     {
       uuid: uuidv5(
-        upgradeCtaImpressionInsertId({
-          distinctId,
-          surface: properties.surface,
-          source: properties.source,
-          utcDay: day,
-        }),
+        event === PAID_FUNNEL_EVENTS.upgradeCtaImpressed
+          ? upgradeCtaImpressionInsertId({
+              distinctId,
+              surface: properties.surface,
+              source: properties.source,
+              utcDay: day,
+            })
+          : JSON.stringify([
+              event,
+              1,
+              distinctId,
+              properties.surface,
+              properties.source ?? null,
+              day,
+            ]),
         uuidv5.URL,
       ),
     },
   );
-  if (!captured) return false;
+  if (!captured) return "unavailable";
 
   try {
     window.localStorage.setItem(
-      UPGRADE_IMPRESSION_STORAGE_KEY,
+      storageKey,
       JSON.stringify({ day, keys: [...state.keys, dedupeKey].slice(-100) }),
     );
   } catch {
     // Best-effort dedupe only.
   }
-  return true;
+  return "captured";
 }
 
 export function captureUpgradeCtaClick(properties: CtaAnalyticsProperties) {
@@ -219,11 +419,9 @@ export function getPostHogRequestHeaders(): HeadersInit {
   const posthog = getReadyPostHogClient();
   if (!posthog) return {};
 
-  const distinctId = posthog.get_distinct_id();
   const sessionId = posthog.get_session_id?.();
 
   return {
-    ...(distinctId && { "X-POSTHOG-DISTINCT-ID": distinctId }),
-    ...(sessionId && { "X-POSTHOG-SESSION-ID": sessionId }),
+    ...(sessionId && { [POSTHOG_SESSION_ID_HEADER]: sessionId }),
   };
 }
