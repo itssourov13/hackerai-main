@@ -14,6 +14,7 @@ NoSQL injection exploits the mismatch between how applications pass user input t
 - Form fields with bracket notation (`field[$ne]=`) coerced into operator objects by Express, PHP, and similar middleware
 - URL-encoded JSON in query strings, headers, and cookies
 - GraphQL variables passed directly into resolver-level NoSQL filters
+- Scalar search, filter, selector, and authorization strings may be compiled into another expression language instead of a NoSQL operator object. Before testing or closing any such field, load `query_language_injection` and run its Required First Pass on every scalar sink
 
 **Code patterns that enable injection**
 - Raw filter dicts/objects from user input handed to `find`/`findOne`/`aggregate`
@@ -91,7 +92,7 @@ Binary search the character space to minimize requests. Works on any string fiel
 
 ### `$where` JavaScript Injection
 
-If `$where` operator is enabled (disabled by default in MongoDB 7.0+; MongoDB 4.4–6.x deprecated it but left `javascriptEnabled` defaulting to `true`), inject arbitrary server-side JavaScript:
+If `$where` is enabled, inject server-side JavaScript. Inspect `security.javascriptEnabled` / `--noscripting`, managed-service restrictions, and the installed engine version. Verify operator availability, defaults, and supported functions against that build's documentation or controlled probes; deprecation alone does not mean execution is disabled ([MongoDB documentation](https://www.mongodb.com/docs/manual/reference/operator/query/where/)):
 ```json
 {"$where": "function(){return this.role == 'admin'}"}                          // direct filter — returns matching documents
 {"$where": "function(){return this.username == 'admin' && sleep(2000)}"}       // timing oracle only — sleep() returns undefined (falsy), so no documents are returned; observe latency
@@ -241,7 +242,7 @@ DoS surface (use only with explicit authorization scope):
 
 1. **Identify query-receiving endpoints** — login, search, filter, lookup
 2. **Determine input format** — JSON body vs form fields vs URL params
-3. **Send error-probing payloads** — malformed operator objects; watch for MongoDB/driver errors
+3. **Send error-probing payloads** — test malformed operator objects and watch for MongoDB/driver errors. For scalar expression construction, load `query_language_injection` and complete its Required First Pass before closing the field
 4. **Attempt operator injection** — `$ne`, `$gt`, `$regex` against login endpoint
 5. **Confirm boolean oracle** — response, status, redirect differs between true/false predicates
 6. **Extract data blindly** — character-by-character `$regex` on sensitive fields (token, reset code)
